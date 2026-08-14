@@ -1,0 +1,304 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+# Needed so the Release can be created and the files uploaded.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: v
+        name: Work out the version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # A warning (not an error) when the tag disagrees with Cargo.toml.
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::warning::Tag says $VERSION but Cargo.toml says $CARGO_VERSION"
+          fi
+
+  windows:
+    name: Windows (x86_64)
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package as zip
+        shell: pwsh
+        run: |
+          $name = "eFM-${{ needs.meta.outputs.version }}-windows-x86_64"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/eFM.exe "dist/$name/"
+          Copy-Item README.md "dist/$name/"
+          # Optimal is already the default; spelled out so nobody "optimises" it
+          # into Fastest later.
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -CompressionLevel Optimal
+          Get-ChildItem dist/*.zip | Format-Table Name, @{n = 'MB'; e = { [math]::Round($_.Length / 1MB, 2) } }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux (AppImage)
+    needs: meta
+    # Deliberately an older runner: the binary links against glibc 2.35, so it
+    # also runs on older distros — and inside the Flatpak 24.08 runtime.
+    # If the label is ever retired, switch to ubuntu-latest at the cost of
+    # compatibility.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libasound2-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            desktop-file-utils file
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The Flatpak job picks up this very binary, so it is not built twice.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: target/release/eFM
+          if-no-files-found: error
+
+      - name: Set up the AppDir
+        run: |
+          mkdir -p AppDir/usr/share/metainfo
+          cp packaging/linux/io.github.tedlaz.eFM.metainfo.xml AppDir/usr/share/metainfo/
+
+      - name: AppImage
+        env:
+          # The runners have no FUSE, so the tools run extracted.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          curl -fsSLO https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          # The continuous build moved to its own repository; the old AppImageKit
+          # URL is kept as a fallback so a move cannot break a release.
+          curl -fsSLO https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            || curl -fsSLO https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage
+
+          # linuxdeploy only fills the AppDir here (AppRun, desktop file, icon and
+          # the bundled libraries, which it strips on the way in).
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable target/release/eFM \
+            --desktop-file packaging/linux/io.github.tedlaz.eFM.desktop \
+            --icon-file assets/icon-256.png \
+            --icon-filename io.github.tedlaz.eFM
+
+          # Packing it ourselves is only so we can pick the compression: the
+          # squashfs default is gzip, and xz takes a good bit more off.
+          mkdir -p dist
+          ./appimagetool-x86_64.AppImage --comp xz AppDir \
+            "dist/eFM-${VERSION}-x86_64.AppImage"
+
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  flatpak:
+    name: Linux (Flatpak)
+    needs: [meta, linux]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      # flatpak-builder wants to create namespaces of its own.
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch the prebuilt binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+          path: packaging/flatpak
+
+      - name: Restore the execute bit
+        # download-artifact does not preserve it.
+        run: chmod +x packaging/flatpak/eFM
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: eFM-${{ needs.meta.outputs.version }}-x86_64.flatpak
+          manifest-path: packaging/flatpak/io.github.tedlaz.eFM.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+
+      - name: Bundle size
+        run: ls -lh *.flatpak
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-flatpak
+          path: '*.flatpak'
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal dmg)
+    needs: meta
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Intel + Apple Silicon)
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Assemble the .app
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          APP="dist/eFM.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          # One binary for both architectures.
+          lipo -create -output "$APP/Contents/MacOS/eFM" \
+            target/x86_64-apple-darwin/release/eFM \
+            target/aarch64-apple-darwin/release/eFM
+          lipo -info "$APP/Contents/MacOS/eFM"
+
+          sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+
+          # The .icns comes from the 256px PNG — downscaling only, no blurry upscales.
+          ICONSET=eFM.iconset
+          mkdir -p "$ICONSET"
+          sips -z 16 16     assets/icon-256.png --out "$ICONSET/icon_16x16.png"      >/dev/null
+          sips -z 32 32     assets/icon-256.png --out "$ICONSET/icon_16x16@2x.png"   >/dev/null
+          sips -z 32 32     assets/icon-256.png --out "$ICONSET/icon_32x32.png"      >/dev/null
+          sips -z 64 64     assets/icon-256.png --out "$ICONSET/icon_32x32@2x.png"   >/dev/null
+          sips -z 128 128   assets/icon-256.png --out "$ICONSET/icon_128x128.png"    >/dev/null
+          sips -z 256 256   assets/icon-256.png --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+          cp assets/icon-256.png "$ICONSET/icon_256x256.png"
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/eFM.icns"
+
+          # lipo throws away the signature the linker adds; without at least an
+          # ad-hoc one, macOS on Apple Silicon refuses to run the binary.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
+
+      - name: Build the dmg
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          mkdir -p staging
+          cp -R dist/eFM.app staging/
+          ln -s /Applications staging/Applications
+          # ULFO (LZFSE) instead of the usual UDZO (zlib): smaller image, and it
+          # needs macOS 10.11+, well under the 11.0 the app already asks for.
+          hdiutil create -volname "eFM" -srcfolder staging -ov -format ULFO \
+            "dist/eFM-$VERSION-macos-universal.dmg"
+
+          ls -lh dist/*.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish to Releases
+    needs: [meta, windows, linux, flatpak, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: 'dist-*'
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: eFM ${{ needs.meta.outputs.version }}
+          generate_release_notes: true
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          body: |
+            ## Downloads
+
+            | System | File |
+            | --- | --- |
+            | Windows 10/11 (x86_64) | `eFM-${{ needs.meta.outputs.version }}-windows-x86_64.zip` |
+            | Linux (any distro) | `eFM-${{ needs.meta.outputs.version }}-x86_64.AppImage` |
+            | Linux (Flatpak) | `eFM-${{ needs.meta.outputs.version }}-x86_64.flatpak` |
+            | macOS 11+ (Intel & Apple Silicon) | `eFM-${{ needs.meta.outputs.version }}-macos-universal.dmg` |
+
+            ### Installing
+
+            - **AppImage**: `chmod +x eFM-*.AppImage && ./eFM-*.AppImage`
+            - **Flatpak**: `flatpak install --user eFM-*.flatpak`
+            - **macOS**: the package is not signed by Apple. If Gatekeeper blocks
+              it: `xattr -dr com.apple.quarantine /Applications/eFM.app`
+            - **Windows**: SmartScreen may ask for "More info → Run anyway",
+              because the executable has no code signing certificate.
+
+            `SHA256SUMS` verifies the files.

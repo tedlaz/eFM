@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tedlaz.eFM</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>eFM</name>
+  <summary>Minimal player for internet radio streams</summary>
+  <summary xml:lang="el">Μινιμαλιστικός player για ραδιοφωνικά streams</summary>
+
+  <description>
+    <p>
+      eFM is a small desktop player for internet radio streams (Icecast/Shoutcast,
+      MP3/AAC/OGG/FLAC). Paste a stream address and press Play.
+    </p>
+    <ul>
+      <li>Shows ICY metadata when the station sends it: artist, track, album, station name, genre and bitrate.</li>
+      <li>Remembers recently played stations and resumes the last stream on startup.</li>
+      <li>Reconnects on its own three seconds after a dropped connection.</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.tedlaz.eFM.desktop</launchable>
+
+  <url type="homepage">https://github.com/tedlaz/eFM</url>
+  <url type="bugtracker">https://github.com/tedlaz/eFM/issues</url>
+
+  <developer id="io.github.tedlaz">
+    <name>Ted Lazaros</name>
+  </developer>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-14">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=eFM
+GenericName=Internet Radio Player
+Comment=Minimal desktop player for internet radio streams
+Comment[el]=Μινιμαλιστικός player για ραδιοφωνικά streams του internet
+Exec=eFM
+Icon=io.github.tedlaz.eFM
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=radio;stream;icecast;shoutcast;music;
+StartupWMClass=eFM

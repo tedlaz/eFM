@@ -1,0 +1,39 @@
+# The Flatpak does not rebuild the Rust code (that would need the whole cargo
+# registry vendored for an offline build). It takes the binary already built by
+# the `linux` job on ubuntu-22.04 (glibc 2.35) — which runs happily on the 24.08
+# runtime (glibc 2.39).
+app-id: io.github.tedlaz.eFM
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: eFM
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  # The whole point of the app: streams from the internet.
+  - --share=network
+  # Exporting/importing the list goes through the xdg-portal, so no blanket
+  # access to the user's files is needed.
+
+modules:
+  - name: eFM
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 eFM /app/bin/eFM
+      - install -Dm644 io.github.tedlaz.eFM.desktop /app/share/applications/io.github.tedlaz.eFM.desktop
+      - install -Dm644 io.github.tedlaz.eFM.metainfo.xml /app/share/metainfo/io.github.tedlaz.eFM.metainfo.xml
+      - install -Dm644 io.github.tedlaz.eFM.png /app/share/icons/hicolor/256x256/apps/io.github.tedlaz.eFM.png
+    sources:
+      - type: file
+        path: eFM
+      - type: file
+        path: ../linux/io.github.tedlaz.eFM.desktop
+      - type: file
+        path: ../linux/io.github.tedlaz.eFM.metainfo.xml
+      - type: file
+        path: ../../assets/icon-256.png
+        dest-filename: io.github.tedlaz.eFM.png

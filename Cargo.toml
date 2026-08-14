@@ -1,0 +1,54 @@
+[package]
+name = "efm"
+version = "0.1.0"
+edition = "2024"
+
+# The package stays lowercase (that is what crates.io wants), but the executable
+# takes the proper name of the app.
+[[bin]]
+name = "eFM"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+# Without the default features: wgpu drags in a whole shader compiler (naga) that
+# we do not need — glow is plenty for the two triangles we paint.
+eframe = { version = "0.36.1", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
+egui = "0.36.1"
+icy-metadata = { version = "0.6.0", features = ["reqwest"] }
+# The file dialog for exporting/importing the list. On Windows it is the native
+# dialog; on Linux the default features give us the xdg-portal one.
+rfd = "0.17.2"
+# Only the codecs the README promises, without audio recording.
+rodio = { version = "0.22.2", default-features = false, features = [
+    "playback",
+    "mp3",
+    "mp4",
+    "flac",
+    "vorbis",
+    "dither",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# The defaults turn on `reqwest/default-tls`, which in reqwest 0.13 means rustls —
+# and a second TLS stack got built next to the native-tls of Windows.
+stream-download = { version = "0.24.3", default-features = false, features = [
+    "reqwest-native-tls",
+] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.24"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
