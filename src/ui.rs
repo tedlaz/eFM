@@ -7,6 +7,7 @@ use egui::{
 
 use crate::App;
 use crate::player::{NowPlaying, Status};
+use crate::search;
 use crate::theme;
 
 /// The margin on the left and right of the whole page.
@@ -17,12 +18,18 @@ const ROW_H: f32 = 56.0;
 /// What the user asked for in this frame. We collect it and run it at the end, so
 /// the buttons do not borrow `App` while they are being drawn.
 enum Action {
+    /// A station of the list: it is an address, so it plays.
     Play(String),
+    /// Whatever was typed: an address plays, anything else opens the search.
+    Submit(String),
     Resume,
     Pause,
     Forget(String),
     Export,
     Import,
+    /// The stations that were ticked in the search window, as (url, name).
+    AddFound(Vec<(String, String)>),
+    CloseSearch,
 }
 
 /// How long the export/import message stays on screen.
@@ -59,8 +66,10 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
                 });
         });
 
+    draw_search_window(app, root.ctx(), &mut action);
+
     if let Some(action) = action {
-        apply(app, action);
+        apply(app, action, root.ctx());
     }
 }
 
@@ -231,7 +240,7 @@ fn draw_hero_buttons(
                 } else if *status == Status::Paused {
                     Action::Resume
                 } else {
-                    Action::Play(app.pending_url().to_owned())
+                    Action::Submit(app.pending_url().to_owned())
                 });
             }
         });
@@ -345,15 +354,22 @@ fn draw_address_bar(app: &mut App, ui: &mut egui::Ui, action: &mut Option<Action
                 // Right to left: the button keeps its place and the field spreads
                 // over the remaining space.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // The same field does both jobs, so the button says which one
+                    // the text in it will do.
+                    let typed = app.url_input.trim().to_owned();
+                    let searching = !typed.is_empty() && !search::looks_like_address(&typed);
                     let button = ui.add_enabled(
-                        !app.url_input.trim().is_empty(),
-                        egui::Button::new(RichText::new("Connect").color(theme::TEXT))
-                            .fill(theme::ACCENT),
+                        !typed.is_empty(),
+                        egui::Button::new(
+                            RichText::new(if searching { "Search" } else { "Connect" })
+                                .color(theme::TEXT),
+                        )
+                        .fill(theme::ACCENT),
                     );
 
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut app.url_input)
-                            .hint_text("https://… stream address")
+                            .hint_text("https://… stream address, or a name to search")
                             .frame(egui::Frame::NONE)
                             .desired_width(ui.available_width()),
                     );
@@ -361,11 +377,183 @@ fn draw_address_bar(app: &mut App, ui: &mut egui::Ui, action: &mut Option<Action
                     let entered =
                         field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if button.clicked() || entered {
-                        *action = Some(Action::Play(app.url_input.clone()));
+                        *action = Some(Action::Submit(app.url_input.clone()));
                     }
                 });
             });
         });
+}
+
+/// The window with the search results: one tick box per station, and a button
+/// that adds all the ticked ones to the main list.
+fn draw_search_window(app: &mut App, ctx: &egui::Context, action: &mut Option<Action>) {
+    let list_full = app.config.is_full();
+    let Some(search) = &mut app.search else {
+        return;
+    };
+    search.poll();
+
+    let mut open = true;
+    let title = format!("Search: {}", search.query);
+    let mut picked: Option<Vec<(String, String)>> = None;
+
+    egui::Window::new(title)
+        .id(egui::Id::new("search-window"))
+        .collapsible(false)
+        .resizable(true)
+        .default_size(vec2(420.0, 460.0))
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::NONE
+                .fill(theme::BACKDROP)
+                .stroke(Stroke::new(1.0, theme::CARD_OUTLINE))
+                .corner_radius(theme::ROUND)
+                .inner_margin(egui::Margin::same(12)),
+        )
+        .open(&mut open)
+        .show(ctx, |ui| match &mut search.state {
+            search::State::Searching => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Searching…").size(12.5).color(theme::MUTED));
+                });
+                // No repaint is scheduled by itself while we wait; the worker asks
+                // for one when it is done, but the spinner needs to keep turning.
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            search::State::Failed(error) => {
+                ui.colored_label(theme::DANGER, format!("The search failed: {error}"));
+            }
+            search::State::Ready(found) if found.is_empty() => {
+                ui.label(
+                    RichText::new("No station found.")
+                        .size(12.5)
+                        .color(theme::MUTED),
+                );
+            }
+            search::State::Ready(found) => {
+                let selected = found.iter().filter(|f| f.checked).count();
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(match found.len() {
+                            1 => "1 station found".to_owned(),
+                            n => format!("{n} stations found"),
+                        })
+                        .size(12.0)
+                        .color(theme::MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if list_button(ui, "None", selected > 0).clicked() {
+                            found.iter_mut().for_each(|f| f.checked = false);
+                        }
+                        if list_button(ui, "All", selected < found.len()).clicked() {
+                            found.iter_mut().for_each(|f| f.checked = true);
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // The buttons at the bottom keep their place; the list takes the rest.
+                let reserved = 46.0;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - reserved).max(80.0))
+                    .show(ui, |ui| {
+                        for station in found.iter_mut() {
+                            draw_found_row(ui, station);
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if list_full {
+                        ui.label(
+                            RichText::new("The list is full")
+                                .size(11.5)
+                                .color(theme::DANGER),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = match selected {
+                            0 => "Add".to_owned(),
+                            n => format!("Add {n}"),
+                        };
+                        if list_button(ui, &label, selected > 0 && !list_full).clicked() {
+                            picked = Some(
+                                found
+                                    .iter()
+                                    .filter(|f| f.checked)
+                                    .map(|f| (f.url.clone(), f.name.clone()))
+                                    .collect(),
+                            );
+                        }
+                        if list_button(ui, "Close", true).clicked() {
+                            *action = Some(Action::CloseSearch);
+                        }
+                    });
+                });
+            }
+        });
+
+    if let Some(picked) = picked {
+        *action = Some(Action::AddFound(picked));
+    } else if !open {
+        *action = Some(Action::CloseSearch);
+    }
+}
+
+/// One result: the tick box, the name and the details of the station underneath.
+fn draw_found_row(ui: &mut egui::Ui, station: &mut search::Found) {
+    let row = egui::Frame::NONE
+        .fill(if station.checked {
+            theme::SURFACE_HOVER
+        } else {
+            theme::SURFACE
+        })
+        .corner_radius(theme::ROUND)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let box_response = ui.checkbox(&mut station.checked, "");
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&station.name).size(13.5).color(theme::TEXT),
+                        )
+                        .truncate(),
+                    );
+                    if !station.meta.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&station.meta).size(11.0).color(theme::MUTED),
+                            )
+                            .truncate(),
+                        );
+                    }
+                });
+                box_response
+            })
+            .inner
+        });
+
+    // Anywhere on the row toggles the tick, not just the little box — but a click
+    // that the box itself took must not be counted a second time.
+    let response = ui.interact(
+        row.response.rect,
+        ui.id().with(("found", &station.url)),
+        Sense::click(),
+    );
+    if response.clicked() && !row.inner.clicked() {
+        station.checked = !station.checked;
+    }
+    response.on_hover_text(&station.url);
+    ui.add_space(4.0);
 }
 
 /// The counter, the separator and the list of recent stations.
@@ -717,9 +905,15 @@ fn line(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32) {
     theme::marquee(ui, rect, text, font, color);
 }
 
-fn apply(app: &mut App, action: Action) {
+fn apply(app: &mut App, action: Action, ctx: &egui::Context) {
     match action {
         Action::Play(url) => app.start(url),
+        Action::Submit(text) => app.submit(text, ctx),
+        Action::AddFound(stations) => {
+            app.add_found(&stations);
+            app.search = None;
+        }
+        Action::CloseSearch => app.search = None,
         Action::Resume => {
             // If the buffer drained while we were paused, a fresh connection is needed.
             let resumed = app.player.as_ref().is_some_and(|p| p.resume());

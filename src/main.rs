@@ -3,11 +3,13 @@
 
 mod config;
 mod player;
+mod search;
 mod theme;
 mod ui;
 
 use config::Config;
 use player::Player;
+use search::Search;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -55,6 +57,8 @@ struct App {
     muted: bool,
     /// Short message about the list export/import, with the time it was written.
     note: Option<(String, std::time::Instant)>,
+    /// The search window, while it is open.
+    search: Option<Search>,
 }
 
 impl App {
@@ -79,6 +83,7 @@ impl App {
             reconnect_at: None,
             muted: false,
             note: None,
+            search: None,
         };
 
         if app.config.autoplay && !app.config.last_url.is_empty() {
@@ -103,6 +108,42 @@ impl App {
         self.reconnect_at = None;
         self.config.remember(&url);
         self.config.save();
+    }
+
+    /// What the user asked for with Connect (or Enter): a stream address is played
+    /// straight away, anything else is taken as a search of the directory.
+    fn submit(&mut self, text: String, ctx: &egui::Context) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if search::looks_like_address(&text) {
+            self.start(text);
+            return;
+        }
+        self.search = Some(Search::start(&text, ctx));
+        // The window shows what was asked for, so the field is free again.
+        self.url_input.clear();
+    }
+
+    /// Puts the stations that were ticked in the search window into the list.
+    fn add_found(&mut self, stations: &[(String, String)]) {
+        let mut added = 0;
+        for (url, name) in stations {
+            if self.config.add(url, Some(name)) {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.config.save();
+        }
+
+        let missed = stations.len() - added;
+        self.say(match (added, missed) {
+            (0, _) => "No new stations".to_owned(),
+            (1, 0) => "Added 1 station".to_owned(),
+            (n, 0) => format!("Added {n} stations"),
+            (n, missed) => format!("Added {n}, skipped {missed}"),
+        });
     }
 
     /// What the card button will play: whatever was typed, otherwise the station

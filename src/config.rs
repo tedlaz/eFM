@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// How many URLs we keep in the history.
-const MAX_RECENT: usize = 20;
+/// How many stations the list holds. It is no longer a mere history: the search
+/// hands over whole batches at a time, so there is room for a real collection.
+const MAX_RECENT: usize = 200;
 
 /// One history entry: the URL and, if the station sent it, its name.
 #[derive(Debug, Clone, Serialize)]
@@ -143,19 +144,36 @@ impl Config {
         for line in text.lines() {
             let url = line.trim();
             // "#" allows comments in a list written by hand.
-            if url.is_empty() || url.starts_with('#') || self.station(url).is_some() {
+            if url.starts_with('#') {
                 continue;
             }
-            if self.recent.len() >= MAX_RECENT {
+            if self.is_full() {
                 break;
             }
-            self.recent.push(Station {
-                url: url.to_owned(),
-                name: None,
-            });
-            added += 1;
+            if self.add(url, None) {
+                added += 1;
+            }
         }
         added
+    }
+
+    /// Appends a station at the end of the list, keeping its name if we were given
+    /// one. Returns `false` for a station we already know, or once the list is full.
+    pub fn add(&mut self, url: &str, name: Option<&str>) -> bool {
+        let url = url.trim();
+        if url.is_empty() || self.is_full() || self.station(url).is_some() {
+            return false;
+        }
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        self.recent.push(Station {
+            url: url.to_owned(),
+            name: name.map(str::to_owned),
+        });
+        true
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.recent.len() >= MAX_RECENT
     }
 
     /// Names the station as soon as the ICY metadata sends it.
