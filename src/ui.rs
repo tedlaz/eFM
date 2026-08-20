@@ -43,10 +43,6 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
 
     app.note_station_name(&now);
 
-    // The height the window needs folded. It is measured rather than assumed: a
-    // long station name wraps and makes the card taller.
-    let mut folded_height = crate::FOLDED_HEIGHT;
-
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BACKDROP))
         .show(root, |ui| {
@@ -64,8 +60,10 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
                 .show(ui, |ui| {
                     draw_hero(app, ui, &now, &status, &mut action);
                     // The card ends here, and under it the margin: that is the
-                    // whole of the folded window.
-                    folded_height = ui.min_rect().bottom() + PAGE_PAD;
+                    // whole of the folded window. It is measured rather than
+                    // assumed, and kept, because the button that folds the
+                    // window needs it at the moment it is clicked.
+                    app.folded_height = ui.min_rect().bottom() + PAGE_PAD;
 
                     // Folded away, the lower half is not drawn at all.
                     if app.unfolded {
@@ -77,7 +75,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
                 });
         });
 
-    fold_window(app, root.ctx(), folded_height);
+    fold_window(app, root.ctx());
 
     draw_search_window(app, root.ctx(), &mut action);
 
@@ -235,48 +233,53 @@ fn titlebar_button(
 /// the lower half alone. One step is over in one such frame; a slide would have
 /// paid that price over and over.
 ///
-/// `folded` is the height the card asked for on this frame.
-fn fold_window(app: &mut App, ctx: &egui::Context, folded: f32) {
-    let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
-        return;
-    };
-    let target = if app.unfolded {
-        app.unfolded_height
-    } else {
-        folded
-    };
+fn fold_window(app: &mut App, ctx: &egui::Context) {
+    let height = window_size(ctx).y;
 
-    // A click has just changed the height and the window is on its way there.
-    // Nothing else may touch it until it arrives, or we would be arguing with a
-    // resize of our own.
-    if app.resizing {
-        if (inner.height() - target).abs() <= 0.5 {
-            app.resizing = false;
-        } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(
-                inner.width(),
-                target,
-            )));
+    if let Some((asked, before)) = app.asked_height {
+        // Wait for an answer: the height we asked for, or any change at all — a
+        // compositor is free to have ideas of its own, and asking again on every
+        // frame would be a resize storm.
+        if (height - asked).abs() <= 1.0 || (height - before).abs() > 1.0 {
+            app.asked_height = None;
         }
         return;
     }
 
     if app.unfolded {
-        // Open and settled, the height belongs to the user: they may drag the
-        // window taller, and all we do is remember what they chose so it opens
-        // back to it. A maximised window is not a choice of height, so it is not
-        // one worth keeping.
+        // Open and standing still, the height belongs to the user: they may drag
+        // the window taller, and all we do is remember what they chose so it
+        // opens back to it. A maximised window is not a choice of height, so it
+        // is not one worth keeping.
         if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
-            app.unfolded_height = inner.height();
+            app.unfolded_height = height;
         }
-    } else if (inner.height() - folded).abs() > 0.5 {
-        // Folded, the card decides — and it can change height on its own when a
-        // long station name wraps.
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(
-            inner.width(),
-            folded,
-        )));
+    } else if !app.folded_trimmed && (height - app.folded_height).abs() > 1.0 {
+        // The window is born at a guessed height, because how tall the card
+        // comes out is only known once it has been laid out. This trims it to
+        // the real one, once.
+        ask_height(app, ctx, app.folded_height);
     }
+}
+
+/// Asks the window for a height, and remembers what it was when we asked so
+/// [`fold_window`] can tell an answer from silence.
+fn ask_height(app: &mut App, ctx: &egui::Context, height: f32) {
+    let size = window_size(ctx);
+    app.asked_height = Some((height, size.y));
+    app.folded_trimmed = true;
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(size.x, height)));
+}
+
+/// How big the window is, in points.
+///
+/// This is the rectangle egui itself is drawing into, rather than
+/// `viewport().inner_rect`, which is the obvious source and the wrong one: winit
+/// will not tell a Wayland client where its window sits, so on Wayland that
+/// whole rectangle is `None` — and the drawer could not open at all, because the
+/// resize was never asked for.
+fn window_size(ctx: &egui::Context) -> egui::Vec2 {
+    ctx.viewport_rect().size()
 }
 
 /// The purple card with whatever is playing now, and the controls.
@@ -355,7 +358,12 @@ fn draw_hero_buttons(
             ui.add_space(8.0);
             if fold_button(ui, app.unfolded).clicked() {
                 app.unfolded = !app.unfolded;
-                app.resizing = true;
+                let height = if app.unfolded {
+                    app.unfolded_height
+                } else {
+                    app.folded_height
+                };
+                ask_height(app, ui.ctx(), height);
             }
         });
     });

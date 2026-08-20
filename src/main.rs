@@ -95,9 +95,16 @@ struct App {
     /// window at the moment it folds, so one the user has resized returns as it
     /// was rather than to some size of ours.
     unfolded_height: f32,
-    /// Set while the window is on its way to the height the drawer just asked
-    /// for. Until it arrives, nothing else may touch the height.
-    resizing: bool,
+    /// The height the window needs with the drawer folded away — the card and
+    /// the margin under it — measured as it is drawn.
+    folded_height: f32,
+    /// A height we have asked the window for, with the height it had when we
+    /// asked, while we wait to see what it does about it.
+    asked_height: Option<(f32, f32)>,
+    /// Whether the folded window has already been trimmed to the card. The
+    /// window is born at a guessed height, and this is what stops us from asking
+    /// about it over and over if it will not take it.
+    folded_trimmed: bool,
 }
 
 impl App {
@@ -124,7 +131,9 @@ impl App {
             search: None,
             unfolded: false,
             unfolded_height: UNFOLDED_HEIGHT,
-            resizing: false,
+            folded_height: FOLDED_HEIGHT,
+            asked_height: None,
+            folded_trimmed: false,
         };
 
         if app.config.autoplay && !app.config.last_url.is_empty() {
