@@ -60,6 +60,11 @@ pub struct Config {
     pub volume: f32,
     /// Whether `last_url` starts on its own at launch.
     pub autoplay: bool,
+    /// Where the window sat on the desktop when it was last closed, in the
+    /// logical points the windowing system counts in. `None` until a first run
+    /// has ended, and on the platforms that will not tell us (Wayland).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_pos: Option<[f32; 2]>,
 }
 
 impl Default for Config {
@@ -69,6 +74,7 @@ impl Default for Config {
             recent: Vec::new(),
             volume: 1.0,
             autoplay: true,
+            window_pos: None,
         }
     }
 }

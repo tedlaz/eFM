@@ -11,20 +11,48 @@ use config::Config;
 use player::Player;
 use search::Search;
 
+/// The window height with the drawer open. It is only the starting point: as
+/// soon as the user resizes the window, that is the height the drawer gives back.
+const UNFOLDED_HEIGHT: f32 = 720.0;
+
+/// What the window opens at, folded. The exact height depends on how tall the
+/// card comes out, which we only know once it has been laid out — the first frame
+/// measures it and corrects this guess.
+pub const FOLDED_HEIGHT: f32 = 196.0;
+
 fn main() -> eframe::Result {
+    // The settings are read before the window exists, because the place it should
+    // open at is one of them.
+    let config = Config::load();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        // Folded is how the app starts, so that is the size it is born at: opening
+        // tall and snapping shut on the first frame would be a flinch.
+        .with_inner_size([480.0, FOLDED_HEIGHT])
+        // Low enough for the folded window; the drawer is what makes the window
+        // tall, not the user.
+        .with_min_inner_size([380.0, 170.0])
+        // We paint the title bar ourselves, in the colours of the app.
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_icon(icon())
+        .with_app_id("eFM");
+    // Where it stood when it was last closed. Without one — a first run, or a
+    // system that does not let us ask — the desktop places the window itself.
+    if let Some([x, y]) = config.window_pos {
+        viewport = viewport.with_position([x, y]);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 720.0])
-            .with_min_inner_size([380.0, 420.0])
-            // We paint the title bar ourselves, in the colours of the app.
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_icon(icon())
-            .with_app_id("eFM"),
+        viewport,
         ..Default::default()
     };
 
-    eframe::run_native("eFM", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native(
+        "eFM",
+        options,
+        Box::new(move |cc| Ok(Box::new(App::new(cc, config)))),
+    )
 }
 
 /// The window icon. It is stored as raw RGBA pixels instead of a PNG, so that no
@@ -59,12 +87,22 @@ struct App {
     note: Option<(String, std::time::Instant)>,
     /// The search window, while it is open.
     search: Option<Search>,
+    /// Whether the lower half — the address bar and the station list — is out.
+    /// Every launch starts folded: the card is what the app is for, the list is
+    /// a drawer that is pulled open when it is wanted.
+    unfolded: bool,
+    /// The height to give the window back when it unfolds. It is read off the
+    /// window at the moment it folds, so one the user has resized returns as it
+    /// was rather than to some size of ours.
+    unfolded_height: f32,
+    /// Set while the window is on its way to the height the drawer just asked
+    /// for. Until it arrives, nothing else may touch the height.
+    resizing: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         theme::apply(&cc.egui_ctx);
-        let config = Config::load();
 
         let (player, audio_error) = match Player::new(cc.egui_ctx.clone()) {
             Ok(player) => {
@@ -84,6 +122,9 @@ impl App {
             muted: false,
             note: None,
             search: None,
+            unfolded: false,
+            unfolded_height: UNFOLDED_HEIGHT,
+            resizing: false,
         };
 
         if app.config.autoplay && !app.config.last_url.is_empty() {
@@ -183,6 +224,31 @@ impl App {
         }
     }
 
+    /// Keeps track of where the window sits, so the next launch opens in the same
+    /// place. The windowing system reports it in the same points that
+    /// `with_position` expects, so it goes into the settings as it comes.
+    fn watch_window_pos(&mut self, ctx: &egui::Context) {
+        let pos = ctx.input(|i| {
+            let viewport = i.viewport();
+            // Minimised or maximised is not where the user put the window: the
+            // position to come back to is the one it had before.
+            if viewport.minimized.unwrap_or(false) || viewport.maximized.unwrap_or(false) {
+                return None;
+            }
+            // Rounded: the points make a round trip through the pixels of the
+            // screen, and on a scaled display that costs a fraction of a point
+            // each time. Whole numbers keep the window from creeping across the
+            // desktop over many launches.
+            viewport
+                .outer_rect
+                .map(|rect| [rect.min.x.round(), rect.min.y.round()])
+        });
+        if let Some(pos) = pos {
+            // Only the exit writes the file; here we just keep it up to date.
+            self.config.window_pos = Some(pos);
+        }
+    }
+
     /// Live streams do drop; if the queue runs dry while we are supposedly
     /// playing, we reconnect after a short wait.
     fn watch_for_dropped_stream(&mut self, ctx: &egui::Context) {
@@ -212,6 +278,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.watch_window_pos(ui.ctx());
         self.watch_for_dropped_stream(ui.ctx());
         ui::draw(self, ui);
     }

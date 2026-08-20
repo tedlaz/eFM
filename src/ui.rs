@@ -43,6 +43,10 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
 
     app.note_station_name(&now);
 
+    // The height the window needs folded. It is measured rather than assumed: a
+    // long station name wraps and makes the card taller.
+    let mut folded_height = crate::FOLDED_HEIGHT;
+
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BACKDROP))
         .show(root, |ui| {
@@ -59,12 +63,21 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
                 })
                 .show(ui, |ui| {
                     draw_hero(app, ui, &now, &status, &mut action);
-                    ui.add_space(10.0);
-                    draw_address_bar(app, ui, &mut action);
-                    ui.add_space(10.0);
-                    draw_stations(app, ui, &now, &status, &mut action);
+                    // The card ends here, and under it the margin: that is the
+                    // whole of the folded window.
+                    folded_height = ui.min_rect().bottom() + PAGE_PAD;
+
+                    // Folded away, the lower half is not drawn at all.
+                    if app.unfolded {
+                        ui.add_space(10.0);
+                        draw_address_bar(app, ui, &mut action);
+                        ui.add_space(10.0);
+                        draw_stations(app, ui, &now, &status, &mut action);
+                    }
                 });
         });
+
+    fold_window(app, root.ctx(), folded_height);
 
     draw_search_window(app, root.ctx(), &mut action);
 
@@ -212,6 +225,60 @@ fn titlebar_button(
     response
 }
 
+/// Takes the window to the height the drawer asks for, in one step.
+///
+/// There is no animation here on purpose. The height of a window cannot be
+/// animated smoothly: every resize costs the app a frame — measured at some 90ms
+/// on Windows against 5ms for an ordinary one — and for as long as it lasts the
+/// desktop shows the frame it was last given, stretched to the new size. That
+/// drags the title bar and the card into a motion that is supposed to belong to
+/// the lower half alone. One step is over in one such frame; a slide would have
+/// paid that price over and over.
+///
+/// `folded` is the height the card asked for on this frame.
+fn fold_window(app: &mut App, ctx: &egui::Context, folded: f32) {
+    let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
+        return;
+    };
+    let target = if app.unfolded {
+        app.unfolded_height
+    } else {
+        folded
+    };
+
+    // A click has just changed the height and the window is on its way there.
+    // Nothing else may touch it until it arrives, or we would be arguing with a
+    // resize of our own.
+    if app.resizing {
+        if (inner.height() - target).abs() <= 0.5 {
+            app.resizing = false;
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(
+                inner.width(),
+                target,
+            )));
+        }
+        return;
+    }
+
+    if app.unfolded {
+        // Open and settled, the height belongs to the user: they may drag the
+        // window taller, and all we do is remember what they chose so it opens
+        // back to it. A maximised window is not a choice of height, so it is not
+        // one worth keeping.
+        if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            app.unfolded_height = inner.height();
+        }
+    } else if (inner.height() - folded).abs() > 0.5 {
+        // Folded, the card decides — and it can change height on its own when a
+        // long station name wraps.
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(
+            inner.width(),
+            folded,
+        )));
+    }
+}
+
 /// The purple card with whatever is playing now, and the controls.
 fn draw_hero(
     app: &mut App,
@@ -282,6 +349,13 @@ fn draw_hero_buttons(
                 } else {
                     Action::Submit(app.pending_url().to_owned())
                 });
+            }
+
+            // The drawer handle sits just left of the play button, on the same row.
+            ui.add_space(8.0);
+            if fold_button(ui, app.unfolded).clicked() {
+                app.unfolded = !app.unfolded;
+                app.resizing = true;
             }
         });
     });
@@ -405,6 +479,51 @@ fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Respo
     }
 
     response
+}
+
+/// The handle of the drawer: it pulls the address bar and the station list out
+/// from under the card, and puts them back. The chevron points down at what is
+/// hidden, and up once the list is out.
+fn fold_button(ui: &mut egui::Ui, unfolded: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(38.0, 30.0), Sense::click());
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(response.id, response.hovered(), 0.12);
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(8),
+        // A well sunk into the card, which lifts towards the outline on hover.
+        theme::BACKDROP.lerp_to_gamma(theme::CARD_OUTLINE, 0.18 + 0.22 * t),
+        Stroke::new(1.0, theme::CARD_OUTLINE),
+        StrokeKind::Inside,
+    );
+
+    // Drawn as two strokes rather than a glyph: the chevrons of the default font
+    // sit off centre.
+    const HALF_W: f32 = 5.5;
+    const HALF_H: f32 = 3.0;
+    let c = rect.center();
+    // Down while the list is hidden, up while it is showing.
+    let tip = if unfolded { -HALF_H } else { HALF_H };
+    let stroke = Stroke::new(2.0, theme::MUTED.lerp_to_gamma(theme::TEXT, t));
+    painter.line_segment(
+        [pos2(c.x - HALF_W, c.y - tip), pos2(c.x, c.y + tip)],
+        stroke,
+    );
+    painter.line_segment(
+        [pos2(c.x, c.y + tip), pos2(c.x + HALF_W, c.y - tip)],
+        stroke,
+    );
+
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if unfolded {
+            "Hide the stations"
+        } else {
+            "Show the stations"
+        })
 }
 
 /// One bar of the level meter, and the gap to the next one.
