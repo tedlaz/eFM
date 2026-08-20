@@ -82,22 +82,17 @@ fn draw_titlebar(ui: &mut egui::Ui) {
 
     let painter = ui.painter().clone();
     let cy = rect.center().y;
-    let logo = pos2(rect.left() + PAGE_PAD + 9.0, cy);
-    painter.circle_filled(logo, 9.0, theme::ACCENT);
-    theme::one_line(
-        &painter,
-        logo,
-        Align2::CENTER_CENTER,
-        "♪",
-        font(11.0),
-        theme::TEXT,
-        20.0,
-    );
+    /// The tallest bar of the mark. The title bar is 40px, so this leaves it
+    /// breathing room above and below.
+    const LOGO_H: f32 = 20.0;
+    let half = logo_width(LOGO_H) * 0.5;
+    let logo = pos2(rect.left() + PAGE_PAD + half, cy);
+    app_logo(&painter, logo, LOGO_H);
     // The version comes from Cargo.toml at compile time, so bumping the release
     // is enough — there is no second place to keep in sync.
     theme::one_line(
         &painter,
-        pos2(logo.x + 17.0, cy),
+        pos2(logo.x + half + 9.0, cy),
         Align2::LEFT_CENTER,
         concat!("eFM v", env!("CARGO_PKG_VERSION")),
         FontId::new(17.0, FontFamily::Proportional),
@@ -137,6 +132,51 @@ fn draw_titlebar(ui: &mut egui::Ui) {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
     }
+}
+
+/// The app mark: the level meter of the window icon, without the disc around it.
+///
+/// The disc is what makes the icon cohere as a tile on a desktop; in here the
+/// title bar is already the container, and leaving it out buys the bars enough
+/// room to read. Inside a 22px disc they did not: three bars of near-equal
+/// height flanking a taller one turn into a pause symbol, which is the one thing
+/// a player must not say about itself.
+///
+/// `height` is the tallest bar; everything else is a fraction of it. The rising
+/// then falling shape matters as much as the size — a symmetric pair is exactly
+/// what reads as pause, an uneven run reads as a meter.
+fn app_logo(painter: &egui::Painter, centre: egui::Pos2, height: f32) {
+    /// Bar heights as fractions of `height`.
+    const HEIGHTS: [f32; 4] = [0.45, 0.75, 1.0, 0.60];
+    /// Which one carries the gold, as the tall bar does in the icon.
+    const ACCENT_BAR: usize = 2;
+    /// Bar width and the gap between two, in the same units.
+    const BAR: f32 = 0.20;
+    const GAP: f32 = 0.125;
+
+    let (w, gap) = (height * BAR, height * GAP);
+    let left = centre.x - logo_width(height) * 0.5 + w * 0.5;
+
+    for (i, factor) in HEIGHTS.iter().enumerate() {
+        let bar = Rect::from_center_size(
+            pos2(left + i as f32 * (w + gap), centre.y),
+            vec2(w, height * factor),
+        );
+        painter.rect_filled(
+            bar,
+            CornerRadius::same((w * 0.5).round() as u8),
+            if i == ACCENT_BAR {
+                theme::TITLE
+            } else {
+                theme::ACCENT
+            },
+        );
+    }
+}
+
+/// How wide `app_logo` draws, so the title bar can place what follows it.
+fn logo_width(height: f32) -> f32 {
+    4.0 * (height * 0.20) + 3.0 * (height * 0.125)
 }
 
 /// A title bar button. On hover the tile behind it fades in, and the glyph turns
@@ -326,19 +366,77 @@ fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Respo
         )
     };
 
+    let time = ui.input(|i| i.time);
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(8), fill);
-    theme::one_line(
-        painter,
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        font(14.0),
-        text,
-        rect.width() - 10.0,
-    );
+
+    // The level meter runs only while the station is really playing and the
+    // pointer is elsewhere. On hover the button has already turned into a red
+    // Pause, and a meter still bouncing on top of that would be claiming two
+    // things at once.
+    if playing && !hot {
+        let label_font = font(14.0);
+        let galley = painter.layout_no_wrap(label.to_owned(), label_font.clone(), text);
+        // Meter and word travel together as one group, centred in the button.
+        let left = rect.center().x - (METER_WIDTH + METER_PAD + galley.size().x) * 0.5;
+
+        live_meter(painter, pos2(left, rect.center().y), text, time);
+        theme::one_line(
+            painter,
+            pos2(left + METER_WIDTH + METER_PAD, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            label_font,
+            text,
+            rect.width(),
+        );
+        // Nothing else would ask for the next frame while the card sits still.
+        ui.ctx().request_repaint();
+    } else {
+        theme::one_line(
+            painter,
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            font(14.0),
+            text,
+            rect.width() - 10.0,
+        );
+    }
 
     response
+}
+
+/// One bar of the level meter, and the gap to the next one.
+const METER_BAR: f32 = 2.0;
+const METER_GAP: f32 = 2.0;
+/// The meter as a whole: four bars and the three gaps between them.
+const METER_WIDTH: f32 = 4.0 * METER_BAR + 3.0 * METER_GAP;
+/// The distance between the meter and the word beside it.
+const METER_PAD: f32 = 7.0;
+
+/// Four little bars that bounce while the stream plays, the way the level meter
+/// on a tuner does. `left` is the middle of the meter's left edge.
+fn live_meter(painter: &egui::Painter, left: egui::Pos2, color: Color32, time: f64) {
+    /// The shortest and tallest a bar gets.
+    const SHORT: f32 = 4.0;
+    const TALL: f32 = 14.0;
+    /// Rate and starting phase per bar. The rates are deliberately not multiples
+    /// of one another, so the four never fall into a visible lockstep.
+    const MOTION: [(f64, f64); 4] = [(3.7, 0.0), (5.1, 1.7), (2.9, 3.1), (4.3, 0.8)];
+
+    for (i, (rate, phase)) in MOTION.iter().enumerate() {
+        let swing = 0.5 + 0.5 * (time * rate + phase).sin() as f32;
+        let height = SHORT + (TALL - SHORT) * swing;
+        let bar = Rect::from_min_size(
+            pos2(
+                left.x + i as f32 * (METER_BAR + METER_GAP),
+                left.y - height * 0.5,
+            ),
+            vec2(METER_BAR, height),
+        );
+        painter.rect_filled(bar, CornerRadius::same(1), color);
+    }
 }
 
 /// The address bar, styled like a search field.
@@ -362,7 +460,7 @@ fn draw_address_bar(app: &mut App, ui: &mut egui::Ui, action: &mut Option<Action
                         !typed.is_empty(),
                         egui::Button::new(
                             RichText::new(if searching { "Search" } else { "Connect" })
-                                .color(theme::TEXT),
+                                .color(theme::ON_ACCENT),
                         )
                         .fill(theme::ACCENT),
                     );
@@ -795,7 +893,7 @@ fn draw_station_row(
         Align2::CENTER_CENTER,
         glyph,
         font(13.0),
-        theme::TEXT,
+        theme::ON_ACCENT,
         30.0,
     );
 
@@ -991,7 +1089,7 @@ fn headline(app: &App, now: &NowPlaying, status: &Status) -> (String, Color32) {
         return (error.clone(), theme::TEXT);
     }
     match status {
-        Status::Error(message) => (message.clone(), Color32::from_rgb(0xF4, 0x7A, 0x7A)),
+        Status::Error(message) => (message.clone(), theme::ERROR),
         Status::Idle => ("No station".to_owned(), theme::TEXT),
         Status::Connecting => ("Connecting to the station…".to_owned(), theme::TEXT),
         _ => {
