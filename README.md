@@ -6,8 +6,9 @@ A minimal desktop player for internet radio streams, written in Rust.
 
 - Enter a stream address (Icecast/Shoutcast, MP3/AAC/OGG/FLAC).
 - One **Play** button, which reads **Live** in green while the stream is playing
-  and turns into a red **Pause** as soon as the mouse goes over it. The volume
-  control sits next to it.
+  and turns into a red **Stop** as soon as the mouse goes over it. Stop drops the
+  stream; Play connects again and picks the station up live. The volume control
+  sits next to it.
 - Shows the ICY metadata when the station sends it: artist, track, album (if
   present), station name, genre and bitrate.
 - On startup it resumes the last stream automatically.

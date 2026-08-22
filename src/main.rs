@@ -160,6 +160,16 @@ impl App {
         self.config.save();
     }
 
+    /// Stops the stream. Nothing is kept to resume from: the station is live, so
+    /// the next Play reconnects and picks it up where it is by then.
+    fn stop(&mut self) {
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        self.playing_url.clear();
+        self.reconnect_at = None;
+    }
+
     /// What the user asked for with Connect (or Enter): a stream address is played
     /// straight away, anything else is taken as a search of the directory.
     fn submit(&mut self, text: String, ctx: &egui::Context) {

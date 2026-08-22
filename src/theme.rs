@@ -31,8 +31,10 @@ pub const LIVE: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99);
 /// The app name in the title bar, and the metadata of the track. The one warm
 /// colour in the palette, which is what makes it read as an accent at all.
 pub const TITLE: Color32 = Color32::from_rgb(0xFB, 0xBF, 0x24);
-/// The red of the button that closes the window.
+/// The red of the button that closes the window, and of Stop.
 pub const DANGER: Color32 = Color32::from_rgb(0xF4, 0x3F, 0x5E);
+/// `DANGER` under the pointer: the same lift `ACCENT_HOVER` gives the blue.
+pub const DANGER_HOVER: Color32 = Color32::from_rgb(0xFB, 0x71, 0x85);
 /// Failure messages. A lighter tint of `DANGER`, because a whole line of the
 /// saturated red is hard to read on the backdrop.
 pub const ERROR: Color32 = Color32::from_rgb(0xFD, 0xA4, 0xAF);

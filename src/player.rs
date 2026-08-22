@@ -31,13 +31,12 @@ pub enum Status {
     /// Connecting to the station / filling the buffer.
     Connecting,
     Playing,
-    Paused,
     Error(String),
 }
 
 impl Status {
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Connecting | Self::Playing | Self::Paused)
+        matches!(self, Self::Connecting | Self::Playing)
     }
 }
 
@@ -134,28 +133,18 @@ impl Player {
         self.player.set_volume(volume);
     }
 
-    pub fn pause(&self) {
-        self.player.pause();
+    /// Stops the stream for good: the connection is dropped and the buffer
+    /// thrown away. There is nothing to resume — a live stream that waits is a
+    /// stream that has fallen behind — so the next Play reconnects from scratch.
+    pub fn stop(&self) {
+        // Bumping the generation makes a connection still on its way land on a
+        // stale ticket, so it is dropped instead of starting to play later.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.player.clear();
         self.update_state(|s| {
-            if s.status == Status::Playing {
-                s.status = Status::Paused;
-            }
+            s.status = Status::Idle;
+            s.now = NowPlaying::default();
         });
-    }
-
-    /// Resumes after a pause. Returns `false` if there is nothing left to resume
-    /// (e.g. the buffer drained meanwhile) and a fresh connection is needed.
-    pub fn resume(&self) -> bool {
-        if self.player.empty() {
-            return false;
-        }
-        self.player.play();
-        self.update_state(|s| {
-            if s.status == Status::Paused {
-                s.status = Status::Playing;
-            }
-        });
-        true
     }
 
     /// Starts (or switches to) a station. Returns immediately; the connection is

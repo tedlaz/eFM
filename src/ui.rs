@@ -22,8 +22,8 @@ enum Action {
     Play(String),
     /// Whatever was typed: an address plays, anything else opens the search.
     Submit(String),
-    Resume,
-    Pause,
+    /// Drops the stream: the next Play connects afresh.
+    Stop,
     Forget(String),
     Export,
     Import,
@@ -46,7 +46,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BACKDROP))
         .show(root, |ui| {
-            draw_titlebar(ui);
+            draw_titlebar(ui, &status);
 
             egui::Frame::NONE
                 // Bottom margin as wide as the sides: otherwise the scroll bar
@@ -84,8 +84,10 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
     }
 }
 
-/// The title bar. Dragging moves the window, a double click maximises it.
-fn draw_titlebar(ui: &mut egui::Ui) {
+/// The title bar. Dragging moves the window, a double click maximises it. While
+/// a station is on the air it also carries the live indicator, over on the right
+/// next to the window buttons.
+fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
     let (rect, drag) = ui.allocate_exact_size(
         vec2(ui.available_width(), TITLEBAR_H),
         Sense::click_and_drag(),
@@ -124,6 +126,15 @@ fn draw_titlebar(ui: &mut egui::Ui) {
         "—",
         theme::SURFACE_HOVER,
     );
+
+    // The indicator sits just left of the window buttons: right of the middle of
+    // the bar, but still clearly apart from them.
+    if *status == Status::Playing {
+        let time = ui.input(|i| i.time);
+        live_badge(&painter, pos2(minimize.rect.left() - 14.0, cy), time);
+        // Nothing else would ask for the next frame while the window sits still.
+        ui.ctx().request_repaint();
+    }
 
     if close.clicked() {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -318,7 +329,9 @@ fn draw_hero_buttons(
 ) {
     let has_audio = app.player.is_some();
     let has_url = !app.pending_url().is_empty();
-    let playing = *status == Status::Playing;
+    // Connecting counts as live here: the button is the way out of a connection
+    // that hangs, otherwise a second press would only start a third one.
+    let live = status.is_active();
 
     ui.horizontal(|ui| {
         // Volume on the left, in the space the old "Stop" button left behind.
@@ -343,12 +356,10 @@ fn draw_hero_buttons(
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let can_press = has_audio && (playing || *status == Status::Paused || has_url);
+            let can_press = has_audio && (live || has_url);
             if play_button(ui, status, can_press).clicked() {
-                *action = Some(if playing {
-                    Action::Pause
-                } else if *status == Status::Paused {
-                    Action::Resume
+                *action = Some(if live {
+                    Action::Stop
                 } else {
                     Action::Submit(app.pending_url().to_owned())
                 });
@@ -416,9 +427,10 @@ fn mute_button(ui: &mut egui::Ui, silent: bool, enabled: bool) -> egui::Response
         .on_hover_text(if silent { "Unmute" } else { "Mute" })
 }
 
-/// The playback button. While the stream plays it shows "Live" in green; as soon
-/// as the mouse goes over it, it turns red and says what the click will do, i.e.
-/// pause. Fixed width, so the row does not shift as the label changes.
+/// The playback button. It only ever says what a click will do: Stop while the
+/// stream plays, in red, and Play in blue otherwise. That the station is on the
+/// air is the title bar's job to show, not this one's — so the green is gone from
+/// here. Fixed width, so the row does not shift as the label changes.
 fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Response {
     let sense = if enabled {
         Sense::click()
@@ -429,16 +441,16 @@ fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Respo
 
     let hot = enabled && response.hovered();
     let t = ui.ctx().animate_bool_with_time(response.id, hot, 0.12);
-    let playing = *status == Status::Playing;
+    // A connection on its way is stoppable too, and the button says so.
+    let live = status.is_active();
 
     let (fill, text, label) = if !enabled {
         (theme::SURFACE, theme::MUTED, "▶  Play")
-    } else if playing {
+    } else if live {
         (
-            theme::LIVE.lerp_to_gamma(theme::DANGER, t),
-            // Dark letters on the light green, white ones on the red.
-            theme::BACKDROP.lerp_to_gamma(theme::TEXT, t),
-            if hot { "⏸  Pause" } else { "Live" },
+            theme::DANGER.lerp_to_gamma(theme::DANGER_HOVER, t),
+            theme::TEXT,
+            "⏹  Stop",
         )
     } else {
         (
@@ -448,45 +460,39 @@ fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Respo
         )
     };
 
-    let time = ui.input(|i| i.time);
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(8), fill);
-
-    // The level meter runs only while the station is really playing and the
-    // pointer is elsewhere. On hover the button has already turned into a red
-    // Pause, and a meter still bouncing on top of that would be claiming two
-    // things at once.
-    if playing && !hot {
-        let label_font = font(14.0);
-        let galley = painter.layout_no_wrap(label.to_owned(), label_font.clone(), text);
-        // Meter and word travel together as one group, centred in the button.
-        let left = rect.center().x - (METER_WIDTH + METER_PAD + galley.size().x) * 0.5;
-
-        live_meter(painter, pos2(left, rect.center().y), text, time);
-        theme::one_line(
-            painter,
-            pos2(left + METER_WIDTH + METER_PAD, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            label_font,
-            text,
-            rect.width(),
-        );
-        // Nothing else would ask for the next frame while the card sits still.
-        ui.ctx().request_repaint();
-    } else {
-        theme::one_line(
-            painter,
-            rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            font(14.0),
-            text,
-            rect.width() - 10.0,
-        );
-    }
+    theme::one_line(
+        painter,
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        font(14.0),
+        text,
+        rect.width() - 10.0,
+    );
 
     response
+}
+
+/// The live indicator of the title bar: the bouncing meter and the word "Live"
+/// beside it. `right` is the middle of the group's right edge, so it can be hung
+/// off whatever sits to its right.
+fn live_badge(painter: &egui::Painter, right: egui::Pos2, time: f64) {
+    let label_font = font(12.5);
+    let galley = painter.layout_no_wrap("Live".to_owned(), label_font.clone(), theme::LIVE);
+    let left = right.x - (METER_WIDTH + METER_PAD + galley.size().x);
+
+    live_meter(painter, pos2(left, right.y), theme::LIVE, time);
+    theme::one_line(
+        painter,
+        pos2(left + METER_WIDTH + METER_PAD, right.y),
+        Align2::LEFT_CENTER,
+        "Live",
+        label_font,
+        theme::LIVE,
+        galley.size().x + 1.0,
+    );
 }
 
 /// The handle of the drawer: it pulls the address bar and the station list out
@@ -840,7 +846,13 @@ fn draw_stations(
 
                     let row = draw_station_row(ui, station.title(), &meta, active, status);
                     if row.play {
-                        *action = Some(Action::Play(station.url.clone()));
+                        // The station that is on the air stops on a click; any
+                        // other one starts.
+                        *action = Some(if active && status.is_active() {
+                            Action::Stop
+                        } else {
+                            Action::Play(station.url.clone())
+                        });
                     }
                     if row.forget {
                         *action = Some(Action::Forget(station.url.clone()));
@@ -1009,8 +1021,8 @@ fn draw_station_row(
         },
     );
     // The glyph shows what a click on this row will do.
-    let glyph = if active && *status == Status::Playing {
-        "⏸"
+    let glyph = if active && status.is_active() {
+        "⏹"
     } else {
         "▶"
     };
@@ -1139,19 +1151,7 @@ fn apply(app: &mut App, action: Action, ctx: &egui::Context) {
             app.search = None;
         }
         Action::CloseSearch => app.search = None,
-        Action::Resume => {
-            // If the buffer drained while we were paused, a fresh connection is needed.
-            let resumed = app.player.as_ref().is_some_and(|p| p.resume());
-            if !resumed {
-                let url = app.playing_url.clone();
-                app.start(url);
-            }
-        }
-        Action::Pause => {
-            if let Some(player) = &app.player {
-                player.pause();
-            }
-        }
+        Action::Stop => app.stop(),
         Action::Forget(url) => {
             app.config.forget(&url);
             app.config.save();
@@ -1228,7 +1228,6 @@ fn headline(app: &App, now: &NowPlaying, status: &Status) -> (String, Color32) {
             match track {
                 // Yellow only when it really is station metadata, not a status.
                 Some(track) => (track, theme::TITLE),
-                None if *status == Status::Paused => ("Paused".to_owned(), theme::TEXT),
                 None => ("Playing".to_owned(), theme::TEXT),
             }
         }
