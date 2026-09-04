@@ -85,12 +85,32 @@ impl Config {
         // new file does not exist yet, we read them from there. The first save
         // writes them to the new location.
         let paths = [config_path(), legacy_config_path()];
-        paths
+        let found = paths
             .into_iter()
             .flatten()
-            .find_map(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+            .find_map(|path| std::fs::read_to_string(&path).ok().map(|raw| (path, raw)));
+        // No file anywhere: a first run, and nothing worth saying about it.
+        let Some((path, raw)) = found else {
+            return Self::default();
+        };
+
+        match serde_json::from_str(&raw) {
+            Ok(config) => config,
+            Err(e) => {
+                // Carrying on from the defaults would have the next save write over
+                // whatever is in there, and a truncated file is often still most of
+                // a station list. So it is set aside rather than destroyed.
+                let kept = path.with_extension("json.bak");
+                eprintln!(
+                    "the settings could not be read ({e}); the file is kept as {}",
+                    kept.display()
+                );
+                if let Err(e) = std::fs::rename(&path, &kept) {
+                    eprintln!("could not set the unreadable settings aside: {e}");
+                }
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -101,13 +121,29 @@ impl Config {
             eprintln!("could not create the settings folder: {e}");
             return;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    eprintln!("could not write the settings: {e}");
-                }
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!("could not serialise the settings: {e}");
+                return;
             }
-            Err(e) => eprintln!("could not serialise the settings: {e}"),
+        };
+
+        // Written beside the real file and then moved onto it. `save` runs on every
+        // play, every nudge of the volume and every name the metadata teaches us, so
+        // a process that dies mid-write is not a rare shot: writing in place would
+        // leave half a file, and `load` would quietly start again from nothing. The
+        // rename is atomic on both platforms — MoveFileEx on Windows, rename(2)
+        // elsewhere — so the file on disk is only ever the old one or the new one.
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json) {
+            eprintln!("could not write the settings: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            eprintln!("could not replace the settings: {e}");
+            // A leftover temp file next to a good config is only confusing later.
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -167,7 +203,10 @@ impl Config {
     /// one. Returns `false` for a station we already know, or once the list is full.
     pub fn add(&mut self, url: &str, name: Option<&str>) -> bool {
         let url = url.trim();
-        if url.is_empty() || self.is_full() || self.station(url).is_some() {
+        // The gate sits here rather than in `import_text`, so that every way into
+        // the list is held to the same standard: a file picked off the disk is not
+        // a more trustworthy source than the directory, which is already filtered.
+        if !is_stream_url(url) || self.is_full() || self.station(url).is_some() {
             return false;
         }
         let name = name.map(str::trim).filter(|n| !n.is_empty());
@@ -208,6 +247,14 @@ impl Config {
     }
 }
 
+/// What counts as a stream we are willing to keep: something we can actually
+/// hand to the player. One rule, used both by the import and by the directory
+/// results, so the two cannot come to disagree.
+pub fn is_stream_url(url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 fn config_path() -> Option<PathBuf> {
     app_config_path("eFM")
 }
@@ -223,7 +270,41 @@ fn app_config_path(app: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, is_stream_url};
+
+    #[test]
+    fn keeps_only_what_the_player_could_open() {
+        let mut config = Config::default();
+        // An imported file is not a more trustworthy source than the directory,
+        // which is filtered by the very same rule.
+        assert!(!config.add("not a url at all", None));
+        assert!(!config.add("ftp://example.com/live", None));
+        assert!(!config.add("www.example.com/live", None));
+        assert!(config.add("https://example.com/live", None));
+        assert_eq!(config.recent.len(), 1);
+    }
+
+    #[test]
+    fn counts_only_the_lines_it_actually_took() {
+        let mut config = Config::default();
+        let added = config.import_text(
+            "# a list written by hand
+https://one.example/live
+rubbish
+http://two.example/live
+",
+        );
+        assert_eq!(added, 2);
+        assert_eq!(config.recent.len(), 2);
+    }
+
+    #[test]
+    fn agrees_with_the_directory_on_what_a_stream_is() {
+        assert!(is_stream_url("http://example.com/live"));
+        assert!(is_stream_url("  https://example.com/live  "));
+        assert!(!is_stream_url("example.com/live"));
+        assert!(!is_stream_url(""));
+    }
 
     #[test]
     fn adds_a_new_station_at_the_top() {

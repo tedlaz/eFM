@@ -45,6 +45,10 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport,
+        // ponytail: no software-rendering knob here — HardwareAcceleration::Off was
+        // tried and WGL has no non-accelerated pixel format that egui can use, so
+        // glutin finds no config and the app does not start. The ~130MB the AMD
+        // driver maps into this process is the price of having a window at all.
         ..Default::default()
     };
 
@@ -53,6 +57,65 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, config)))),
     )
+}
+
+/// Asks the system to stay awake while a station plays, and lets go when it
+/// stops. Without it the idle timer fires in the middle of a song and the radio
+/// goes quiet — the machine has no way of knowing that the silence it is about to
+/// impose is unwelcome.
+///
+/// Only the system is held, never the display: this is a radio, so the screen is
+/// free to blank.
+#[cfg(windows)]
+fn keep_system_awake(awake: bool) {
+    // One declaration is cheaper than a dependency on all of windows-sys for the
+    // sake of a single symbol.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadExecutionState(flags: u32) -> u32;
+    }
+
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+
+    // The state belongs to the thread that sets it and lasts as long as that
+    // thread does, which is why this is only ever called from the UI thread.
+    let flags = if awake {
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    unsafe { SetThreadExecutionState(flags) };
+}
+
+// ponytail: Windows only, because that is where the sleeping-mid-song was seen.
+// Linux wants a D-Bus call to org.freedesktop.ScreenSaver or a systemd inhibitor
+// and macOS wants IOPMAssertionCreateWithName — a dependency each, for a symptom
+// neither has been observed to have.
+#[cfg(not(windows))]
+fn keep_system_awake(_awake: bool) {}
+
+/// How long to wait before the next reconnect: 3s, 6s, 12s, 24s, 48s, then a
+/// minute for as long as it takes. It never gives up — a radio left playing
+/// should come back on its own after an outage — but one request a minute is a
+/// fair price to ask of a station that is gone, where the old fixed three
+/// seconds meant some twelve hundred an hour.
+fn backoff(tries: u32) -> std::time::Duration {
+    const FIRST: u64 = 3;
+    const CAP: u64 = 60;
+    std::time::Duration::from_secs(FIRST.saturating_mul(1 << tries.min(5)).min(CAP))
+}
+
+/// Gives an address the scheme it is missing. `search::looks_like_address` sends
+/// anything starting with "www." straight to the player, and the player parses it
+/// as a URL — which, without a scheme, it is not. So the two agreed that "www."
+/// was an address and then produced "Invalid URL" for every one of them.
+fn normalise_url(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() || text.contains("://") {
+        return text.to_owned();
+    }
+    format!("https://{text}")
 }
 
 /// The window icon. It is stored as raw RGBA pixels instead of a PNG, so that no
@@ -81,6 +144,14 @@ struct App {
     playing_url: String,
     /// Deadline for the automatic reconnect after the stream drops.
     reconnect_at: Option<std::time::Instant>,
+    /// How many times we have reconnected without the user asking. It widens the
+    /// wait, and only a deliberate Play or Stop puts it back to zero: a station
+    /// that connects, plays a second and dies again is exactly the case the
+    /// backoff is for, so recovering the stream must not by itself reset it.
+    reconnect_tries: u32,
+    /// Whether the system has been asked to stay awake for us, so that the ask is
+    /// made when it changes rather than on every frame.
+    keeps_awake: bool,
     /// Mute. It does not touch `config.volume`, so the volume comes back as it was.
     muted: bool,
     /// Short message about the list export/import, with the time it was written.
@@ -126,6 +197,8 @@ impl App {
             player,
             audio_error,
             reconnect_at: None,
+            reconnect_tries: 0,
+            keeps_awake: false,
             muted: false,
             note: None,
             search: None,
@@ -144,7 +217,7 @@ impl App {
 
     /// Starts a station and records it in the settings.
     fn start(&mut self, url: String) {
-        let url = url.trim().to_owned();
+        let url = normalise_url(url.trim());
         if url.is_empty() {
             return;
         }
@@ -168,6 +241,7 @@ impl App {
         }
         self.playing_url.clear();
         self.reconnect_at = None;
+        self.reconnect_tries = 0;
     }
 
     /// What the user asked for with Connect (or Enter): a stream address is played
@@ -268,27 +342,45 @@ impl App {
         }
     }
 
+    /// Holds the system awake for as long as a station is on. `is_active` covers
+    /// connecting as well as playing, and a stalled stream is still playing — so
+    /// the machine also stays up through a reconnect wait rather than dropping
+    /// asleep inside one.
+    fn watch_sleep(&mut self) {
+        let wanted = self
+            .player
+            .as_ref()
+            .is_some_and(|player| player.status().is_active());
+        if wanted != self.keeps_awake {
+            keep_system_awake(wanted);
+            self.keeps_awake = wanted;
+        }
+    }
+
     /// Live streams do drop; if the queue runs dry while we are supposedly
     /// playing, we reconnect after a short wait.
     fn watch_for_dropped_stream(&mut self, ctx: &egui::Context) {
         let Some(player) = &self.player else { return };
 
+        let now = std::time::Instant::now();
         match self.reconnect_at {
             // The queue can look empty for a single frame between two buffers.
             // If it filled up again in the meantime we cancel the reconnect:
             // otherwise the station restarted for no reason and the whole UI
             // flickered.
             Some(_) if !player.has_stalled() => self.reconnect_at = None,
-            Some(at) if std::time::Instant::now() >= at => {
+            Some(at) if now >= at => {
                 let url = self.playing_url.clone();
-                self.reconnect_at = None;
+                self.reconnect_tries = self.reconnect_tries.saturating_add(1);
                 self.start(url);
             }
-            Some(_) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            // Nothing else asks for a frame while we wait, and the wait can now be
+            // a minute long — so we sleep to the deadline instead of polling at it.
+            Some(at) => ctx.request_repaint_after(at.saturating_duration_since(now)),
             None if player.has_stalled() && !self.playing_url.is_empty() => {
-                self.reconnect_at =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
-                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                let wait = backoff(self.reconnect_tries);
+                self.reconnect_at = Some(now + wait);
+                ctx.request_repaint_after(wait);
             }
             None => {}
         }
@@ -299,6 +391,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.watch_window_pos(ui.ctx());
         self.watch_for_dropped_stream(ui.ctx());
+        self.watch_sleep();
         ui::draw(self, ui);
     }
 
@@ -306,5 +399,42 @@ impl eframe::App for App {
     // resources to release. We just save the settings.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.config.save();
+        // A power request left standing after the app is gone would keep the
+        // machine up for nothing at all.
+        keep_system_awake(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backoff, normalise_url};
+
+    #[test]
+    fn widens_the_wait_then_holds_it_at_a_minute() {
+        let seconds: Vec<u64> = (0..8).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(seconds, [3, 6, 12, 24, 48, 60, 60, 60]);
+    }
+
+    #[test]
+    fn never_waits_longer_than_the_cap_however_many_tries() {
+        // The shift is what would overflow if the tries were not clamped first.
+        assert_eq!(backoff(u32::MAX).as_secs(), 60);
+    }
+
+    #[test]
+    fn gives_a_bare_address_the_scheme_it_lacks() {
+        assert_eq!(
+            normalise_url("www.example.com/live"),
+            "https://www.example.com/live"
+        );
+    }
+
+    #[test]
+    fn leaves_an_address_that_has_a_scheme_alone() {
+        assert_eq!(
+            normalise_url("http://example.com/live"),
+            "http://example.com/live"
+        );
+        assert_eq!(normalise_url("  "), "");
     }
 }

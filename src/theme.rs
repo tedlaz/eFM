@@ -102,13 +102,15 @@ fn widget(fill: Color32, stroke: Color32, text: Color32) -> WidgetVisuals {
 }
 
 /// Single-line text inside `rect`, vertically centred. If it does not fit the
-/// width, it scrolls continuously from right to left.
+/// width, it is cut with "…" and scrolls only while the pointer is over it.
 pub fn marquee(ui: &egui::Ui, rect: egui::Rect, text: &str, font: FontId, color: Color32) {
     if text.is_empty() || rect.width() < 1.0 {
         return;
     }
 
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), color);
     // The text must escape neither `rect` nor the list that contains it.
     let painter = ui
         .painter()
@@ -125,13 +127,46 @@ pub fn marquee(ui: &egui::Ui, rect: egui::Rect, text: &str, font: FontId, color:
     /// The gap between the end of the text and its repetition.
     const GAP: f32 = 56.0;
 
+    // At rest the text is simply cut, and the app asks for no frames at all.
+    // Scrolling is what costs: egui has no partial redraw, so every frame the
+    // marquee wants repaints and recomposites the whole window. Paying for that
+    // while nobody is looking at the text is what kept the GPU busy for as long
+    // as a station played.
+    //
+    // ponytail: hover is tested per line, not per row or card — pointing at the
+    // title scrolls the title, not the line under it. If that feels finicky, give
+    // `marquee` a `scroll: bool` and hand it the row's existing `hovered`.
+    let id = egui::Id::new(("marquee", rect.min.x.to_bits(), rect.min.y.to_bits()));
+    if !ui.rect_contains_pointer(rect) {
+        // Forget where it had scrolled to, so the next hover starts from the left.
+        ui.ctx().data_mut(|d| d.remove::<f64>(id));
+        one_line(
+            &painter,
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font,
+            color,
+            rect.width(),
+        );
+        return;
+    }
+
+    // Measured from when the pointer arrived, not from the clock: the absolute
+    // time would drop the reader into the middle of a word.
+    let now = ui.input(|i| i.time);
+    let started = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(id, || now));
+
     // Two copies, so the wrap-around does not show an empty line.
     let span = galley.size().x + GAP;
-    let offset = (ui.input(|i| i.time) as f32 * SPEED).rem_euclid(span);
+    let offset = ((now - started) as f32 * SPEED).rem_euclid(span);
     let x = rect.left() - offset;
     painter.galley(egui::pos2(x, y), galley.clone(), color);
     painter.galley(egui::pos2(x + span, y), galley, color);
-    ui.ctx().request_repaint();
+    // The text moves one pixel every 31ms at this speed, so 30fps is exactly as
+    // smooth as it needs to be, and no smoother.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
 }
 
 /// Single-line text, cut with "…" when it does not fit.

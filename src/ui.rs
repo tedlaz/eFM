@@ -130,10 +130,20 @@ fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
     // The indicator sits just left of the window buttons: right of the middle of
     // the bar, but still clearly apart from them.
     if *status == Status::Playing {
-        let time = ui.input(|i| i.time);
+        // The meter only moves while someone is there to see it. Animating it in
+        // the background woke the whole window ten times a second for as long as
+        // a station played — and playing in the background is what this app is
+        // mostly for. At a fixed zero the four bars stand at four different
+        // heights, so at rest it still reads as a meter rather than a glitch.
+        let focused = ui.input(|i| i.focused);
+        let time = if focused { ui.input(|i| i.time) } else { 0.0 };
         live_badge(&painter, pos2(minimize.rect.left() - 14.0, cy), time);
-        // Nothing else would ask for the next frame while the window sits still.
-        ui.ctx().request_repaint();
+        if focused {
+            // Nothing else would ask for the next frame while the window sits
+            // still. The meter is slow; a few frames a second are enough.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     if close.clicked() {
@@ -1143,6 +1153,11 @@ fn line(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32) {
 }
 
 fn apply(app: &mut App, action: Action, ctx: &egui::Context) {
+    // Asking for a station by hand is a fresh start: whatever the last one was
+    // doing, the widening reconnect wait does not carry over to this one.
+    if matches!(action, Action::Play(_) | Action::Submit(_)) {
+        app.reconnect_tries = 0;
+    }
     match action {
         Action::Play(url) => app.start(url),
         Action::Submit(text) => app.submit(text, ctx),
@@ -1214,6 +1229,13 @@ fn import_list(app: &mut App) {
 fn headline(app: &App, now: &NowPlaying, status: &Status) -> (String, Color32) {
     if let Some(error) = &app.audio_error {
         return (error.clone(), theme::TEXT);
+    }
+    // A stalled stream is still `Playing` as far as the player is concerned, so
+    // without this the card would sit showing the last track it heard — fine for
+    // the first three seconds, but the wait grows to a minute and the app would
+    // just look frozen.
+    if app.reconnect_at.is_some() {
+        return ("Reconnecting…".to_owned(), theme::MUTED);
     }
     match status {
         Status::Error(message) => (message.clone(), theme::ERROR),

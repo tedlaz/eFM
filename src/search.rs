@@ -171,7 +171,7 @@ fn convert(raw: Raw) -> Option<Found> {
         .into_iter()
         .flatten()
         .map(|u| u.trim().to_owned())
-        .find(|u| u.starts_with("http://") || u.starts_with("https://"))?;
+        .find(|u| crate::config::is_stream_url(u))?;
 
     let name = raw.name.unwrap_or_default().trim().to_owned();
     let name = if name.is_empty() {
