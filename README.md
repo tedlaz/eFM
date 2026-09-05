@@ -21,7 +21,7 @@ Ready-made packages for every release are on the
 
 | System | File | Install |
 | --- | --- | --- |
-| Windows 10/11 | `…-windows-x86_64.zip` | Unzip and run `eFM.exe` |
+| Windows 10/11 | `…-windows-x86_64.zip` | `winget install tedlaz.eFM`, or unzip and run `eFM.exe` |
 | Linux (any distro) | `…-x86_64.AppImage` | `chmod +x eFM-*.AppImage && ./eFM-*.AppImage` |
 | Linux (Flatpak) | `…-x86_64.flatpak` | `flatpak install --user eFM-*.flatpak` |
 | macOS 11+ | `…-macos-universal.dmg` | Open it and drag the app to Applications |

@@ -277,6 +277,37 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      # The manifests in packaging/windows are templates; the version and the
+      # checksum are only known here. They are uploaded as a build artifact
+      # rather than a release asset — nobody downloads them, they are opened as
+      # a pull request against microsoft/winget-pkgs.
+      #
+      # ponytail: stamped and left for a manual PR. Handing komac a token to
+      # open that PR by itself is the upgrade, once submitting by hand grates.
+      - uses: actions/checkout@v5
+        with:
+          path: repo
+
+      - name: Stamp the winget manifests
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          ZIP="eFM-$VERSION-windows-x86_64.zip"
+          SHA=$(sha256sum "artifacts/$ZIP" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          mkdir -p winget
+          for f in repo/packaging/windows/*.yaml; do
+            sed -e "s|<VERSION>|$VERSION|g" \
+                -e "s|<SHA256>|$SHA|g" \
+                -e "s|<DATE>|$(date -u +%F)|g" \
+                "$f" > "winget/$(basename "$f")"
+          done
+          cat winget/*.yaml
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: winget-manifests
+          path: winget/*.yaml
+          if-no-files-found: error
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.tag }}

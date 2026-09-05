@@ -27,6 +27,8 @@ enum Action {
     Forget(String),
     Export,
     Import,
+    /// A palette from `theme::PRESETS`, by index.
+    Theme(usize),
     /// The stations that were ticked in the search window, as (url, name).
     AddFound(Vec<(String, String)>),
     CloseSearch,
@@ -36,6 +38,11 @@ enum Action {
 const NOTE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 pub fn draw(app: &mut App, root: &mut egui::Ui) {
+    // A fold asked for last frame. It waits until here so that the frame the
+    // desktop stretches over the resize is the blank one — see `cover`.
+    if let Some(height) = app.pending_fold.take() {
+        ask_height(app, root.ctx(), height);
+    }
     let snapshot = app.player.as_ref().map(|p| p.state());
     let status = snapshot.as_ref().map_or(Status::Idle, |s| s.status.clone());
     let now = snapshot.map(|s| s.now).unwrap_or_default();
@@ -44,9 +51,9 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
     app.note_station_name(&now);
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(theme::BACKDROP))
+        .frame(egui::Frame::NONE.fill(theme::p().backdrop))
         .show(root, |ui| {
-            draw_titlebar(ui, &status);
+            draw_titlebar(ui, &status, &mut action);
 
             egui::Frame::NONE
                 // Bottom margin as wide as the sides: otherwise the scroll bar
@@ -76,6 +83,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
         });
 
     fold_window(app, root.ctx());
+    cover(app, root.ctx());
 
     draw_search_window(app, root.ctx(), &mut action);
 
@@ -87,7 +95,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
 /// The title bar. Dragging moves the window, a double click maximises it. While
 /// a station is on the air it also carries the live indicator, over on the right
 /// next to the window buttons.
-fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
+fn draw_titlebar(ui: &mut egui::Ui, status: &Status, action: &mut Option<Action>) {
     let (rect, drag) = ui.allocate_exact_size(
         vec2(ui.available_width(), TITLEBAR_H),
         Sense::click_and_drag(),
@@ -109,7 +117,7 @@ fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
         Align2::LEFT_CENTER,
         concat!("eFM v", env!("CARGO_PKG_VERSION")),
         FontId::new(17.0, FontFamily::Proportional),
-        theme::TITLE,
+        theme::p().title,
         200.0,
     );
 
@@ -118,14 +126,19 @@ fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
         ui,
         pos2(rect.right() - PAGE_PAD - 16.0, cy),
         "✖",
-        theme::DANGER,
+        theme::p().danger,
     );
     let minimize = titlebar_button(
         ui,
         pos2(rect.right() - PAGE_PAD - 52.0, cy),
         "—",
-        theme::SURFACE_HOVER,
+        theme::p().surface_hover,
     );
+    // "◐": a half-filled disc, which is what every app that swaps palettes uses.
+    let (palette, picked) = theme_button(ui, pos2(rect.right() - PAGE_PAD - 88.0, cy));
+    if let Some(i) = picked {
+        *action = Some(Action::Theme(i));
+    }
 
     // The indicator sits just left of the window buttons: right of the middle of
     // the bar, but still clearly apart from them.
@@ -137,7 +150,7 @@ fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
         // heights, so at rest it still reads as a meter rather than a glitch.
         let focused = ui.input(|i| i.focused);
         let time = if focused { ui.input(|i| i.time) } else { 0.0 };
-        live_badge(&painter, pos2(minimize.rect.left() - 14.0, cy), time);
+        live_badge(&painter, pos2(palette.rect.left() - 14.0, cy), time);
         if focused {
             // Nothing else would ask for the next frame while the window sits
             // still. The meter is slow; a few frames a second are enough.
@@ -155,7 +168,7 @@ fn draw_titlebar(ui: &mut egui::Ui, status: &Status) {
     }
 
     // Dragging moves the window — unless it started on a button.
-    let on_button = close.hovered() || minimize.hovered();
+    let on_button = close.hovered() || minimize.hovered() || palette.hovered();
     if drag.drag_started_by(egui::PointerButton::Primary) && !on_button {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
@@ -198,9 +211,9 @@ fn app_logo(painter: &egui::Painter, centre: egui::Pos2, height: f32) {
             bar,
             CornerRadius::same((w * 0.5).round() as u8),
             if i == ACCENT_BAR {
-                theme::TITLE
+                theme::p().title
             } else {
-                theme::ACCENT
+                theme::p().accent
             },
         );
     }
@@ -237,11 +250,33 @@ fn titlebar_button(
         Align2::CENTER_CENTER,
         glyph,
         font(egui::lerp(12.5..=14.0, t)),
-        theme::MUTED.lerp_to_gamma(theme::TEXT, t),
+        theme::p().muted.lerp_to_gamma(theme::p().text, t),
         rect.width(),
     );
 
     response
+}
+
+/// The palette picker: a title bar button with the list of `theme::PRESETS`
+/// under it. Hands back its own response — the title bar needs it to place the
+/// live meter and to know that a drag started on a button — and the palette the
+/// user picked, if they picked one.
+fn theme_button(ui: &mut egui::Ui, center: egui::Pos2) -> (egui::Response, Option<usize>) {
+    let response = titlebar_button(ui, center, "◐", theme::p().surface_hover);
+    let current = theme::current();
+    let picked = egui::Popup::menu(&response)
+        .show(|ui| {
+            let mut picked = None;
+            for (i, (name, _)) in theme::PRESETS.iter().enumerate() {
+                if ui.selectable_label(i == current, *name).clicked() {
+                    picked = Some(i);
+                    ui.close();
+                }
+            }
+            picked
+        })
+        .and_then(|menu| menu.inner);
+    (response, picked)
 }
 
 /// Takes the window to the height the drawer asks for, in one step.
@@ -283,11 +318,43 @@ fn fold_window(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+/// Paints the whole window flat while it is being resized.
+///
+/// A resize costs the app a frame, and for as long as it lasts the desktop shows
+/// the frame it was last given, stretched to the new size — so the title bar, the
+/// card and every line of text got squashed or pulled for some 90ms, which is the
+/// ugly part of folding the drawer. Stretching a plain rectangle of the backdrop
+/// looks like nothing at all, so that is what the desktop gets: the frame in
+/// which the fold is asked for, and the ones until the new size arrives, are
+/// covered over. The content underneath is still laid out — the fold needs the
+/// heights it measures.
+///
+/// The deadline is what makes this safe: a compositor that never answers the
+/// resize would otherwise leave the window blank for good.
+fn cover(app: &App, ctx: &egui::Context) {
+    let waiting = app.asked_height.is_some()
+        && app
+            .cover_until
+            .is_some_and(|until| std::time::Instant::now() < until);
+    if !(app.pending_fold.is_some() || waiting) {
+        return;
+    }
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("fold-cover"),
+    ))
+    .rect_filled(ctx.viewport_rect(), CornerRadius::ZERO, theme::p().backdrop);
+    // Nothing else is asking for the frame that takes the cover off again.
+    ctx.request_repaint();
+}
 /// Asks the window for a height, and remembers what it was when we asked so
 /// [`fold_window`] can tell an answer from silence.
 fn ask_height(app: &mut App, ctx: &egui::Context, height: f32) {
     let size = window_size(ctx);
     app.asked_height = Some((height, size.y));
+    // Long enough for the ~90ms a resize takes on Windows, and short enough that
+    // a resize that never lands is a flicker rather than a blank window.
+    app.cover_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
     app.folded_trimmed = true;
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(size.x, height)));
 }
@@ -312,8 +379,8 @@ fn draw_hero(
     action: &mut Option<Action>,
 ) {
     egui::Frame::NONE
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::CARD_OUTLINE))
+        .fill(theme::p().card)
+        .stroke(Stroke::new(1.0, theme::p().card_outline))
         .corner_radius(theme::ROUND)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
@@ -379,12 +446,13 @@ fn draw_hero_buttons(
             ui.add_space(8.0);
             if fold_button(ui, app.unfolded).clicked() {
                 app.unfolded = !app.unfolded;
-                let height = if app.unfolded {
+                // Asked for, not done: the resize happens at the top of the next
+                // frame, once this one has gone out blank.
+                app.pending_fold = Some(if app.unfolded {
                     app.unfolded_height
                 } else {
                     app.folded_height
-                };
-                ask_height(app, ui.ctx(), height);
+                });
             }
         });
     });
@@ -403,9 +471,9 @@ fn mute_button(ui: &mut egui::Ui, silent: bool, enabled: bool) -> egui::Response
         .animate_bool_with_time(response.id, enabled && response.hovered(), 0.12);
 
     let color = if !enabled {
-        theme::OUTLINE
+        theme::p().outline
     } else {
-        theme::MUTED.lerp_to_gamma(theme::TEXT, t)
+        theme::p().muted.lerp_to_gamma(theme::p().text, t)
     };
     let painter = ui.painter();
     // Always the same speaker; the red diagonal on top is what shows the mute.
@@ -425,7 +493,7 @@ fn mute_button(ui: &mut egui::Ui, silent: bool, enabled: bool) -> egui::Response
         let d = 9.0;
         painter.line_segment(
             [pos2(c.x - d, c.y - d), pos2(c.x + d, c.y + d)],
-            Stroke::new(2.0, theme::DANGER),
+            Stroke::new(2.0, theme::p().danger),
         );
     }
 
@@ -455,17 +523,17 @@ fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Respo
     let live = status.is_active();
 
     let (fill, text, label) = if !enabled {
-        (theme::SURFACE, theme::MUTED, "▶  Play")
+        (theme::p().surface, theme::p().muted, "▶  Play")
     } else if live {
         (
-            theme::DANGER.lerp_to_gamma(theme::DANGER_HOVER, t),
-            theme::TEXT,
+            theme::p().danger.lerp_to_gamma(theme::p().danger_hover, t),
+            theme::p().text,
             "⏹  Stop",
         )
     } else {
         (
-            theme::ACCENT.lerp_to_gamma(theme::ACCENT_HOVER, t),
-            theme::TEXT,
+            theme::p().accent.lerp_to_gamma(theme::p().accent_hover, t),
+            theme::p().text,
             "▶  Play",
         )
     };
@@ -490,17 +558,17 @@ fn play_button(ui: &mut egui::Ui, status: &Status, enabled: bool) -> egui::Respo
 /// off whatever sits to its right.
 fn live_badge(painter: &egui::Painter, right: egui::Pos2, time: f64) {
     let label_font = font(12.5);
-    let galley = painter.layout_no_wrap("Live".to_owned(), label_font.clone(), theme::LIVE);
+    let galley = painter.layout_no_wrap("Live".to_owned(), label_font.clone(), theme::p().live);
     let left = right.x - (METER_WIDTH + METER_PAD + galley.size().x);
 
-    live_meter(painter, pos2(left, right.y), theme::LIVE, time);
+    live_meter(painter, pos2(left, right.y), theme::p().live, time);
     theme::one_line(
         painter,
         pos2(left + METER_WIDTH + METER_PAD, right.y),
         Align2::LEFT_CENTER,
         "Live",
         label_font,
-        theme::LIVE,
+        theme::p().live,
         galley.size().x + 1.0,
     );
 }
@@ -519,8 +587,10 @@ fn fold_button(ui: &mut egui::Ui, unfolded: bool) -> egui::Response {
         rect,
         CornerRadius::same(8),
         // A well sunk into the card, which lifts towards the outline on hover.
-        theme::BACKDROP.lerp_to_gamma(theme::CARD_OUTLINE, 0.18 + 0.22 * t),
-        Stroke::new(1.0, theme::CARD_OUTLINE),
+        theme::p()
+            .backdrop
+            .lerp_to_gamma(theme::p().card_outline, 0.18 + 0.22 * t),
+        Stroke::new(1.0, theme::p().card_outline),
         StrokeKind::Inside,
     );
 
@@ -531,7 +601,7 @@ fn fold_button(ui: &mut egui::Ui, unfolded: bool) -> egui::Response {
     let c = rect.center();
     // Down while the list is hidden, up while it is showing.
     let tip = if unfolded { -HALF_H } else { HALF_H };
-    let stroke = Stroke::new(2.0, theme::MUTED.lerp_to_gamma(theme::TEXT, t));
+    let stroke = Stroke::new(2.0, theme::p().muted.lerp_to_gamma(theme::p().text, t));
     painter.line_segment(
         [pos2(c.x - HALF_W, c.y - tip), pos2(c.x, c.y + tip)],
         stroke,
@@ -585,12 +655,12 @@ fn live_meter(painter: &egui::Painter, left: egui::Pos2, color: Color32, time: f
 /// The address bar, styled like a search field.
 fn draw_address_bar(app: &mut App, ui: &mut egui::Ui, action: &mut Option<Action>) {
     egui::Frame::NONE
-        .fill(theme::SURFACE)
+        .fill(theme::p().surface)
         .corner_radius(theme::ROUND)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🔍").size(13.0).color(theme::MUTED));
+                ui.label(RichText::new("🔍").size(13.0).color(theme::p().muted));
 
                 // Right to left: the button keeps its place and the field spreads
                 // over the remaining space.
@@ -603,9 +673,9 @@ fn draw_address_bar(app: &mut App, ui: &mut egui::Ui, action: &mut Option<Action
                         !typed.is_empty(),
                         egui::Button::new(
                             RichText::new(if searching { "Search" } else { "Connect" })
-                                .color(theme::ON_ACCENT),
+                                .color(theme::p().on_accent),
                         )
-                        .fill(theme::ACCENT),
+                        .fill(theme::p().accent),
                     );
 
                     let field = ui.add(
@@ -646,8 +716,8 @@ fn draw_search_window(app: &mut App, ctx: &egui::Context, action: &mut Option<Ac
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .frame(
             egui::Frame::NONE
-                .fill(theme::BACKDROP)
-                .stroke(Stroke::new(1.0, theme::CARD_OUTLINE))
+                .fill(theme::p().backdrop)
+                .stroke(Stroke::new(1.0, theme::p().card_outline))
                 .corner_radius(theme::ROUND)
                 .inner_margin(egui::Margin::same(12)),
         )
@@ -656,20 +726,24 @@ fn draw_search_window(app: &mut App, ctx: &egui::Context, action: &mut Option<Ac
             search::State::Searching => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Searching…").size(12.5).color(theme::MUTED));
+                    ui.label(
+                        RichText::new("Searching…")
+                            .size(12.5)
+                            .color(theme::p().muted),
+                    );
                 });
                 // No repaint is scheduled by itself while we wait; the worker asks
                 // for one when it is done, but the spinner needs to keep turning.
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             search::State::Failed(error) => {
-                ui.colored_label(theme::DANGER, format!("The search failed: {error}"));
+                ui.colored_label(theme::p().danger, format!("The search failed: {error}"));
             }
             search::State::Ready(found) if found.is_empty() => {
                 ui.label(
                     RichText::new("No station found.")
                         .size(12.5)
-                        .color(theme::MUTED),
+                        .color(theme::p().muted),
                 );
             }
             search::State::Ready(found) => {
@@ -682,7 +756,7 @@ fn draw_search_window(app: &mut App, ctx: &egui::Context, action: &mut Option<Ac
                             n => format!("{n} stations found"),
                         })
                         .size(12.0)
-                        .color(theme::MUTED),
+                        .color(theme::p().muted),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if list_button(ui, "None", selected > 0).clicked() {
@@ -716,7 +790,7 @@ fn draw_search_window(app: &mut App, ctx: &egui::Context, action: &mut Option<Ac
                         ui.label(
                             RichText::new("The list is full")
                                 .size(11.5)
-                                .color(theme::DANGER),
+                                .color(theme::p().danger),
                         );
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -752,9 +826,9 @@ fn draw_search_window(app: &mut App, ctx: &egui::Context, action: &mut Option<Ac
 fn draw_found_row(ui: &mut egui::Ui, station: &mut search::Found) {
     let row = egui::Frame::NONE
         .fill(if station.checked {
-            theme::SURFACE_HOVER
+            theme::p().surface_hover
         } else {
-            theme::SURFACE
+            theme::p().surface
         })
         .corner_radius(theme::ROUND)
         .inner_margin(egui::Margin::symmetric(8, 6))
@@ -765,14 +839,18 @@ fn draw_found_row(ui: &mut egui::Ui, station: &mut search::Found) {
                 ui.vertical(|ui| {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&station.name).size(13.5).color(theme::TEXT),
+                            RichText::new(&station.name)
+                                .size(13.5)
+                                .color(theme::p().text),
                         )
                         .truncate(),
                     );
                     if !station.meta.is_empty() {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&station.meta).size(11.0).color(theme::MUTED),
+                                RichText::new(&station.meta)
+                                    .size(11.0)
+                                    .color(theme::p().muted),
                             )
                             .truncate(),
                         );
@@ -821,7 +899,7 @@ fn draw_stations(
         ui.label(
             RichText::new("Enter a stream address and press Connect.")
                 .size(12.5)
-                .color(theme::MUTED),
+                .color(theme::p().muted),
         );
         return;
     }
@@ -831,9 +909,9 @@ fn draw_stations(
     // scope — outside of here the visuals stay as they were.
     ui.scope(|ui| {
         let widgets = &mut ui.visuals_mut().widgets;
-        widgets.inactive.fg_stroke.color = theme::TITLE;
-        widgets.hovered.fg_stroke.color = theme::TITLE.lerp_to_gamma(theme::TEXT, 0.35);
-        widgets.active.fg_stroke.color = theme::TITLE.lerp_to_gamma(theme::TEXT, 0.55);
+        widgets.inactive.fg_stroke.color = theme::p().title;
+        widgets.hovered.fg_stroke.color = theme::p().title.lerp_to_gamma(theme::p().text, 0.35);
+        widgets.active.fg_stroke.color = theme::p().title.lerp_to_gamma(theme::p().text, 0.55);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -885,14 +963,14 @@ fn draw_list_header(app: &mut App, ui: &mut egui::Ui, action: &mut Option<Action
         Some(text.clone())
     });
     let (text, color) = match note {
-        Some(note) => (note, theme::TITLE),
+        Some(note) => (note, theme::p().title),
         None => (
             match count {
                 0 => "no stations yet".to_owned(),
                 1 => "1 station".to_owned(),
                 n => format!("{n} stations"),
             },
-            theme::MUTED,
+            theme::p().muted,
         ),
     };
 
@@ -925,7 +1003,7 @@ fn list_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response 
     let label_font = font(12.0);
     let text_size = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), label_font.clone(), theme::TEXT)
+        .layout_no_wrap(label.to_owned(), label_font.clone(), theme::p().text)
         .size();
 
     let sense = if enabled {
@@ -942,8 +1020,10 @@ fn list_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response 
     painter.rect(
         rect.expand(egui::lerp(0.0..=1.5, t)),
         CornerRadius::same(8),
-        theme::SURFACE.lerp_to_gamma(theme::SURFACE_HOVER, t),
-        Stroke::new(1.0, theme::OUTLINE.lerp_to_gamma(theme::ACCENT, t)),
+        theme::p()
+            .surface
+            .lerp_to_gamma(theme::p().surface_hover, t),
+        Stroke::new(1.0, theme::p().outline.lerp_to_gamma(theme::p().accent, t)),
         StrokeKind::Inside,
     );
     theme::one_line(
@@ -953,9 +1033,9 @@ fn list_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response 
         label,
         label_font,
         if enabled {
-            theme::MUTED.lerp_to_gamma(theme::TEXT, t)
+            theme::p().muted.lerp_to_gamma(theme::p().text, t)
         } else {
-            theme::OUTLINE
+            theme::p().outline
         },
         rect.width(),
     );
@@ -1005,16 +1085,16 @@ fn draw_station_row(
         rect,
         theme::ROUND,
         if hovered {
-            theme::SURFACE_HOVER
+            theme::p().surface_hover
         } else {
-            theme::SURFACE
+            theme::p().surface
         },
         Stroke::new(
             1.0,
             if active {
-                theme::CARD_OUTLINE
+                theme::p().card_outline
             } else {
-                theme::OUTLINE
+                theme::p().outline
             },
         ),
         StrokeKind::Inside,
@@ -1025,9 +1105,9 @@ fn draw_station_row(
         knob,
         16.0,
         if hovered {
-            theme::ACCENT_HOVER
+            theme::p().accent_hover
         } else {
-            theme::ACCENT
+            theme::p().accent
         },
     );
     // The glyph shows what a click on this row will do.
@@ -1042,7 +1122,7 @@ fn draw_station_row(
         Align2::CENTER_CENTER,
         glyph,
         font(13.0),
-        theme::ON_ACCENT,
+        theme::p().on_accent,
         30.0,
     );
 
@@ -1056,7 +1136,7 @@ fn draw_station_row(
             painter.circle_filled(
                 forget_rect.center(),
                 egui::lerp(9.0..=13.0, t),
-                theme::DANGER.gamma_multiply(t * 0.85),
+                theme::p().danger.gamma_multiply(t * 0.85),
             );
         }
         theme::one_line(
@@ -1065,7 +1145,7 @@ fn draw_station_row(
             Align2::CENTER_CENTER,
             "✖",
             font(12.0),
-            theme::MUTED.lerp_to_gamma(theme::TEXT, t),
+            theme::p().muted.lerp_to_gamma(theme::p().text, t),
             forget_rect.width(),
         );
         forget = forget_response.clicked();
@@ -1101,9 +1181,9 @@ fn draw_station_row(
 
     // The station that is playing scrolls its own metadata; the rest are simply cut.
     let title_color = if active {
-        theme::TEXT
+        theme::p().text
     } else {
-        theme::TEXT.gamma_multiply(0.92)
+        theme::p().text.gamma_multiply(0.92)
     };
     if active {
         theme::marquee(ui, title_rect, title, title_font, title_color);
@@ -1121,7 +1201,7 @@ fn draw_station_row(
 
     if let Some(meta_rect) = meta_rect {
         if active {
-            theme::marquee(ui, meta_rect, meta, meta_font, theme::TITLE);
+            theme::marquee(ui, meta_rect, meta, meta_font, theme::p().title);
         } else {
             theme::one_line(
                 &painter,
@@ -1129,7 +1209,7 @@ fn draw_station_row(
                 Align2::LEFT_CENTER,
                 meta,
                 meta_font,
-                theme::MUTED,
+                theme::p().muted,
                 width,
             );
         }
@@ -1169,6 +1249,16 @@ fn apply(app: &mut App, action: Action, ctx: &egui::Context) {
         Action::Stop => app.stop(),
         Action::Forget(url) => {
             app.config.forget(&url);
+            app.config.save();
+        }
+        Action::Theme(i) => {
+            let name = theme::PRESETS[i].0;
+            theme::set(name);
+            // egui keeps the style it was handed, and DWM the border it was
+            // told about: both have to be told again.
+            theme::restyle(ctx);
+            app.repaint_border = true;
+            app.config.theme = name.to_owned();
             app.config.save();
         }
         Action::Export => export_list(app),
@@ -1228,19 +1318,19 @@ fn import_list(app: &mut App) {
 /// The card title: the track that is playing, otherwise the status.
 fn headline(app: &App, now: &NowPlaying, status: &Status) -> (String, Color32) {
     if let Some(error) = &app.audio_error {
-        return (error.clone(), theme::TEXT);
+        return (error.clone(), theme::p().text);
     }
     // A stalled stream is still `Playing` as far as the player is concerned, so
     // without this the card would sit showing the last track it heard — fine for
     // the first three seconds, but the wait grows to a minute and the app would
     // just look frozen.
     if app.reconnect_at.is_some() {
-        return ("Reconnecting…".to_owned(), theme::MUTED);
+        return ("Reconnecting…".to_owned(), theme::p().muted);
     }
     match status {
-        Status::Error(message) => (message.clone(), theme::ERROR),
-        Status::Idle => ("No station".to_owned(), theme::TEXT),
-        Status::Connecting => ("Connecting to the station…".to_owned(), theme::TEXT),
+        Status::Error(message) => (message.clone(), theme::p().error),
+        Status::Idle => ("No station".to_owned(), theme::p().text),
+        Status::Connecting => ("Connecting to the station…".to_owned(), theme::p().text),
         _ => {
             let track = now
                 .track
@@ -1249,8 +1339,8 @@ fn headline(app: &App, now: &NowPlaying, status: &Status) -> (String, Color32) {
                 .or_else(|| now.station.clone());
             match track {
                 // Yellow only when it really is station metadata, not a status.
-                Some(track) => (track, theme::TITLE),
-                None => ("Playing".to_owned(), theme::TEXT),
+                Some(track) => (track, theme::p().title),
+                None => ("Playing".to_owned(), theme::p().text),
             }
         }
     }
@@ -1262,10 +1352,10 @@ fn detail_line(now: &NowPlaying, status: &Status) -> (String, Color32) {
     if *status == Status::Idle {
         return (
             "Enter a stream address and press Play.".to_owned(),
-            theme::MUTED,
+            theme::p().muted,
         );
     }
-    (track_details(now), theme::TITLE)
+    (track_details(now), theme::p().title)
 }
 
 /// Artist, album, genre, bitrate. The station name is missing on purpose: it is
@@ -1326,7 +1416,7 @@ mod tests {
             artist: Some("The Doors".into()),
             ..Default::default()
         };
-        assert_eq!(detail_line(&now, &Status::Playing).1, theme::TITLE);
-        assert_eq!(detail_line(&now, &Status::Idle).1, theme::MUTED);
+        assert_eq!(detail_line(&now, &Status::Playing).1, theme::p().title);
+        assert_eq!(detail_line(&now, &Status::Idle).1, theme::p().muted);
     }
 }

@@ -1,0 +1,28 @@
+PackageIdentifier: tedlaz.eFM
+PackageVersion: <VERSION>
+PackageLocale: en-US
+Publisher: Ted Lazaros
+PublisherUrl: https://github.com/tedlaz
+PublisherSupportUrl: https://github.com/tedlaz/eFM/issues
+PackageName: eFM
+PackageUrl: https://github.com/tedlaz/eFM
+License: GPL-3.0
+LicenseUrl: https://github.com/tedlaz/eFM/blob/master/LICENSE
+ShortDescription: A minimal desktop player for internet radio streams.
+Description: |-
+  A minimal desktop player for internet radio streams, written in Rust. Enter an
+  Icecast or Shoutcast address (MP3/AAC/OGG/FLAC) and it plays, shows the ICY
+  metadata the station sends, resumes the last stream on startup and reconnects
+  on its own if the connection drops.
+Moniker: efm
+Tags:
+  - audio
+  - icecast
+  - internet-radio
+  - player
+  - radio
+  - shoutcast
+  - streaming
+ReleaseNotesUrl: https://github.com/tedlaz/eFM/releases/tag/v<VERSION>
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

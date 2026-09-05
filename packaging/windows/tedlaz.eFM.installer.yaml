@@ -1,0 +1,19 @@
+PackageIdentifier: tedlaz.eFM
+PackageVersion: <VERSION>
+MinimumOSVersion: 10.0.0.0
+InstallerType: zip
+# There is no installer: the zip holds the executable, and winget links it onto
+# the PATH as `eFM`. Compress-Archive in the release workflow zips the contents
+# of the folder, not the folder, so the exe sits at the root of the archive.
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: eFM.exe
+    PortableCommandAlias: eFM
+UpgradeBehavior: install
+ReleaseDate: <DATE>
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/tedlaz/eFM/releases/download/v<VERSION>/eFM-<VERSION>-windows-x86_64.zip
+    InstallerSha256: <SHA256>
+ManifestType: installer
+ManifestVersion: 1.6.0

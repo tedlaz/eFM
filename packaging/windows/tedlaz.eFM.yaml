@@ -1,0 +1,7 @@
+# The version manifest. <VERSION> is stamped by the release workflow; the file in
+# the repository stays a template so it never goes stale against a tag.
+PackageIdentifier: tedlaz.eFM
+PackageVersion: <VERSION>
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

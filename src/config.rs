@@ -58,6 +58,10 @@ pub struct Config {
     /// The stations of the list, newest first.
     pub recent: Vec<Station>,
     pub volume: f32,
+    /// Which of `theme::PRESETS` the window is painted in, by name. An unknown
+    /// name falls back to the first, so a palette that is dropped from a later
+    /// version does not break the settings.
+    pub theme: String,
     /// Whether `last_url` starts on its own at launch.
     pub autoplay: bool,
     /// Where the window sat on the desktop when it was last closed, in the
@@ -73,6 +77,7 @@ impl Default for Config {
             last_url: String::new(),
             recent: Vec::new(),
             volume: 1.0,
+            theme: crate::theme::PRESETS[0].0.to_owned(),
             autoplay: true,
             window_pos: None,
         }

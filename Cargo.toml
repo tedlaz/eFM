@@ -1,6 +1,6 @@
 [package]
 name = "efm"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 # The package stays lowercase (that is what crates.io wants), but the executable
@@ -16,12 +16,16 @@ directories = "6.0.0"
 # we do not need — glow is plenty for the two triangles we paint.
 eframe = { version = "0.36.1", default-features = false, features = [
     "glow",
-    "default_fonts",
     "wayland",
     "x11",
 ] }
-egui = "0.36.1"
+# Windows loads Segoe UI at runtime instead (see the target section below), so
+# the bundled fonts are off by default and switched back on for other targets.
+egui = { version = "0.36.1", default-features = false }
 icy-metadata = { version = "0.6.0", features = ["reqwest"] }
+# Not a new dependency: eframe already builds it. Naming the version it picked
+# is what lets us read the window handle it hands us, for the DWM calls.
+raw-window-handle = "0.6.2"
 # The file dialog for exporting/importing the list. On Windows it is the native
 # dialog; on Linux the default features give us the xdg-portal one.
 rfd = "0.17.2"
@@ -48,6 +52,11 @@ tokio = { version = "1.53.1", features = [
     # The search opens its own current-thread runtime, which needs the IO driver.
     "net",
 ] }
+
+# Windows reads Segoe UI off the disk (see `theme::system_fonts`), so it is the
+# one target that does not carry egui's 1.4MB of bundled fonts.
+[target.'cfg(not(windows))'.dependencies]
+egui = { version = "0.36.1", features = ["default_fonts"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.24"

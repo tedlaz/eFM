@@ -88,6 +88,60 @@ fn keep_system_awake(awake: bool) {
     unsafe { SetThreadExecutionState(flags) };
 }
 
+/// The two things that tell a Windows 11 window apart from a Windows 10 one:
+/// rounded corners and a border in the colour of the app. The window is
+/// undecorated — we paint the title bar ourselves — so Windows draws no frame of
+/// its own, but DWM still owns the corners and the hairline around them, and
+/// left alone it gives an app in `theme::p().backdrop` square corners and a pale
+/// edge.
+///
+/// ponytail: no `windows` crate for two constants and one call, for the same
+/// reason `keep_system_awake` declares its own. `raw-window-handle` is not a new
+/// dependency either — eframe already builds it; we only name the version it
+/// picked, so that we can read the handle it hands us.
+#[cfg(windows)]
+fn dress_for_windows_11(window: &impl raw_window_handle::HasWindowHandle) {
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const u32, size: u32) -> i32;
+    }
+
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+    const DWMWA_BORDER_COLOR: u32 = 34;
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_ref() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get();
+
+    // Both attributes are younger than the app's minimum Windows, so on 10 they
+    // come back as an error — which is why the result is not worth looking at:
+    // there is nothing to be done about a version that has no rounded corners to
+    // give.
+    for (attr, value) in [
+        (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
+        (DWMWA_BORDER_COLOR, colorref(theme::p().backdrop)),
+    ] {
+        unsafe { DwmSetWindowAttribute(hwnd, attr, &raw const value, size_of::<u32>() as u32) };
+    }
+}
+
+#[cfg(not(windows))]
+fn dress_for_windows_11(_window: &impl raw_window_handle::HasWindowHandle) {}
+
+/// A colour the way Windows spells one: COLORREF is 0x00BBGGRR, which is the
+/// reverse of the order the theme — and everything else — writes it in. Getting
+/// this backwards paints a border that looks plausible and is the wrong colour.
+#[cfg(windows)]
+fn colorref(color: egui::Color32) -> u32 {
+    let [r, g, b, _] = color.to_array();
+    u32::from(b) << 16 | u32::from(g) << 8 | u32::from(r)
+}
+
 // ponytail: Windows only, because that is where the sleeping-mid-song was seen.
 // Linux wants a D-Bus call to org.freedesktop.ScreenSaver or a systemd inhibitor
 // and macOS wants IOPMAssertionCreateWithName — a dependency each, for a symptom
@@ -172,15 +226,28 @@ struct App {
     /// A height we have asked the window for, with the height it had when we
     /// asked, while we wait to see what it does about it.
     asked_height: Option<(f32, f32)>,
+    /// A fold the user asked for, waiting for the blanked frame to be shown
+    /// before the window is actually resized. See `ui::cover`.
+    pending_fold: Option<f32>,
+    /// How long the blank is allowed to last. A compositor that never answers
+    /// the resize must not leave the window empty for good.
+    cover_until: Option<std::time::Instant>,
     /// Whether the folded window has already been trimmed to the card. The
     /// window is born at a guessed height, and this is what stops us from asking
     /// about it over and over if it will not take it.
     folded_trimmed: bool,
+    /// Set when the palette changes: the border DWM paints around the window is
+    /// ours too, and it is only repainted when we ask.
+    repaint_border: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
+        // The palette is chosen before the style is written, so the first frame is
+        // already in the right colours.
+        theme::set(&config.theme);
         theme::apply(&cc.egui_ctx);
+        dress_for_windows_11(cc);
 
         let (player, audio_error) = match Player::new(cc.egui_ctx.clone()) {
             Ok(player) => {
@@ -206,7 +273,10 @@ impl App {
             unfolded_height: UNFOLDED_HEIGHT,
             folded_height: FOLDED_HEIGHT,
             asked_height: None,
+            pending_fold: None,
+            cover_until: None,
             folded_trimmed: false,
+            repaint_border: false,
         };
 
         if app.config.autoplay && !app.config.last_url.is_empty() {
@@ -357,42 +427,90 @@ impl App {
         }
     }
 
-    /// Live streams do drop; if the queue runs dry while we are supposedly
+    /// Live streams do drop; if the stream is not running while we are supposedly
     /// playing, we reconnect after a short wait.
     fn watch_for_dropped_stream(&mut self, ctx: &egui::Context) {
         let Some(player) = &self.player else { return };
 
         let now = std::time::Instant::now();
-        match self.reconnect_at {
-            // The queue can look empty for a single frame between two buffers.
-            // If it filled up again in the meantime we cancel the reconnect:
-            // otherwise the station restarted for no reason and the whole UI
-            // flickered.
-            Some(_) if !player.has_stalled() => self.reconnect_at = None,
-            Some(at) if now >= at => {
+        // A station is meant to be on for as long as we hold its address: only
+        // Stop clears it, and only the user presses Stop.
+        let wanted = !self.playing_url.is_empty();
+        match recovery(is_broken(player), wanted, self.reconnect_at, now) {
+            Recovery::Cancel => self.reconnect_at = None,
+            Recovery::Reconnect => {
                 let url = self.playing_url.clone();
                 self.reconnect_tries = self.reconnect_tries.saturating_add(1);
                 self.start(url);
             }
             // Nothing else asks for a frame while we wait, and the wait can now be
             // a minute long — so we sleep to the deadline instead of polling at it.
-            Some(at) => ctx.request_repaint_after(at.saturating_duration_since(now)),
-            None if player.has_stalled() && !self.playing_url.is_empty() => {
+            Recovery::Wait(at) => ctx.request_repaint_after(at.saturating_duration_since(now)),
+            Recovery::Schedule => {
                 let wait = backoff(self.reconnect_tries);
                 self.reconnect_at = Some(now + wait);
                 ctx.request_repaint_after(wait);
             }
-            None => {}
+            Recovery::Nothing => {}
         }
     }
 }
 
+/// Whether the station we think is on is not actually coming through.
+///
+/// Two ways for that to be true, and for a long time only the first was counted:
+/// the queue ran dry under a `Playing` status, or the attempt to get the stream
+/// back failed and left an error behind. Leaving the second one out is what made
+/// a station that dropped stay dropped — the reconnect set the status to
+/// `Error`, `Error` is not `Playing`, so nothing ever asked for another go and
+/// the app sat silent until it was restarted. One failed retry was enough.
+fn is_broken(player: &Player) -> bool {
+    player.has_stalled() || matches!(player.status(), player::Status::Error(_))
+}
+
+/// What the reconnect loop should do this frame.
+#[derive(Debug, PartialEq, Eq)]
+enum Recovery {
+    Nothing,
+    /// It came back on its own; drop the pending reconnect.
+    Cancel,
+    /// Start waiting.
+    Schedule,
+    /// Keep waiting, and ask to be woken at the deadline.
+    Wait(std::time::Instant),
+    /// The wait is over.
+    Reconnect,
+}
+
+fn recovery(
+    broken: bool,
+    wanted: bool,
+    reconnect_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Recovery {
+    match reconnect_at {
+        // The queue can look empty for a single frame between two buffers. If it
+        // filled up again in the meantime we cancel the reconnect: otherwise the
+        // station restarted for no reason and the whole UI flickered.
+        Some(_) if !broken => Recovery::Cancel,
+        Some(at) if now >= at => Recovery::Reconnect,
+        Some(at) => Recovery::Wait(at),
+        None if broken && wanted => Recovery::Schedule,
+        None => Recovery::Nothing,
+    }
+}
+
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.watch_window_pos(ui.ctx());
         self.watch_for_dropped_stream(ui.ctx());
         self.watch_sleep();
         ui::draw(self, ui);
+        // A palette was picked this frame. `Frame` is a window handle, which is
+        // all the DWM call wants, so the border simply gets painted again.
+        if std::mem::take(&mut self.repaint_border) {
+            dress_for_windows_11(frame);
+        }
     }
 
     // The glow backend hands over the OpenGL context here, for anyone who has GPU
@@ -407,7 +525,53 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff, normalise_url};
+    use super::{Recovery, backoff, normalise_url, recovery};
+    use std::time::{Duration, Instant};
+
+    /// The regression this whole thing is about: a station drops, the reconnect
+    /// fails once and leaves an error behind, and the app has to keep trying.
+    /// Before, `broken` was only ever true while the status still said `Playing`,
+    /// so a failed retry ended the retrying — and the radio stayed silent until
+    /// it was restarted by hand.
+    #[test]
+    fn keeps_trying_after_a_reconnect_that_failed() {
+        let now = Instant::now();
+        assert_eq!(recovery(true, true, None, now), Recovery::Schedule);
+    }
+
+    #[test]
+    fn waits_until_the_deadline_then_reconnects() {
+        let now = Instant::now();
+        let at = now + Duration::from_secs(3);
+        assert_eq!(recovery(true, true, Some(at), now), Recovery::Wait(at));
+        assert_eq!(recovery(true, true, Some(at), at), Recovery::Reconnect);
+    }
+
+    #[test]
+    fn drops_the_reconnect_when_the_stream_comes_back_by_itself() {
+        let now = Instant::now();
+        let at = now + Duration::from_secs(3);
+        assert_eq!(recovery(false, true, Some(at), now), Recovery::Cancel);
+    }
+
+    /// Stop clears the address, and that is what has to end the retrying — a
+    /// station the user switched off must not quietly come back on.
+    #[test]
+    fn leaves_a_stopped_station_alone_however_broken_it_looks() {
+        let now = Instant::now();
+        assert_eq!(recovery(true, false, None, now), Recovery::Nothing);
+        assert_eq!(recovery(false, false, None, now), Recovery::Nothing);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spells_a_colour_the_way_windows_does() {
+        // Not a palindrome, so a swap that did nothing would still pass.
+        assert_eq!(
+            super::colorref(egui::Color32::from_rgb(0x0F, 0x14, 0x24)),
+            0x0024_140F
+        );
+    }
 
     #[test]
     fn widens_the_wait_then_holds_it_at_a_minute() {
