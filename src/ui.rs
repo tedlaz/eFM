@@ -266,12 +266,27 @@ fn theme_button(ui: &mut egui::Ui, center: egui::Pos2) -> (egui::Response, Optio
     let current = theme::current();
     let picked = egui::Popup::menu(&response)
         .show(|ui| {
+            // Two short columns rather than one tall one: egui cannot paint past
+            // the edge of the window, and folded, the window is shorter than the
+            // ten palettes stacked up.
+            ui.spacing_mut().button_padding.y = 4.0;
+            ui.spacing_mut().item_spacing.y = 2.0;
             let mut picked = None;
-            for (i, (name, _)) in theme::PRESETS.iter().enumerate() {
-                if ui.selectable_label(i == current, *name).clicked() {
-                    picked = Some(i);
-                    ui.close();
+            let rows = theme::PRESETS.len().div_ceil(2);
+            ui.horizontal_top(|ui| {
+                for (column, presets) in theme::PRESETS.chunks(rows).enumerate() {
+                    ui.vertical(|ui| {
+                        for (row, (name, _)) in presets.iter().enumerate() {
+                            let i = column * rows + row;
+                            if ui.selectable_label(i == current, *name).clicked() {
+                                picked = Some(i);
+                            }
+                        }
+                    });
                 }
+            });
+            if picked.is_some() {
+                ui.close();
             }
             picked
         })
