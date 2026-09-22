@@ -22,6 +22,13 @@ const BUFFER_BYTES: usize = 512 * 1024;
 const PREFETCH_SECONDS: u64 = 5;
 /// Fallback prefetch when the station declares no bitrate (~128 kbps x 5s).
 const DEFAULT_PREFETCH_BYTES: u64 = 128 / 8 * 1024 * PREFETCH_SECONDS;
+/// The decoded audio goes to the player in pieces of a quarter of a second.
+const CHUNKS_PER_SECOND: usize = 4;
+/// After the queue ran dry, how much has to be decoded again before the sound
+/// comes back: without a lead to spend, every late packet is a click.
+const REBUFFER_CHUNKS: usize = 2 * CHUNKS_PER_SECOND;
+/// The most decoded audio held ahead of the speakers; the rest waits as bytes.
+const MAX_CHUNKS: usize = 10 * CHUNKS_PER_SECOND;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -124,9 +131,10 @@ impl Player {
             .clone()
     }
 
-    /// True when the station has dropped: we think we are playing but the queue ran dry.
+    /// True when the station has dropped: we think we are playing but the queue
+    /// ran dry, or it is paused waiting for audio to build up again (see [`feed`]).
     pub fn has_stalled(&self) -> bool {
-        self.status() == Status::Playing && self.player.empty()
+        self.status() == Status::Playing && (self.player.empty() || self.player.is_paused())
     }
 
     pub fn set_volume(&self, volume: f32) {
@@ -156,8 +164,8 @@ impl Player {
             return;
         }
 
-        // Cancels whatever was running: clear() drops the decoder, which cancels
-        // the download.
+        // Cancels whatever was running: the new generation makes the old `feed`
+        // drop its decoder, which cancels the download; clear() drops its audio.
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.player.clear();
         self.update_state(|s| {
@@ -181,9 +189,8 @@ impl Player {
             let mut guard = state.lock().expect("state mutex poisoned");
             match result {
                 Ok(source) => {
-                    player.append(source);
-                    player.play();
                     guard.status = Status::Playing;
+                    std::thread::spawn(move || feed(source, &player, &current, generation));
                 }
                 Err(e) => {
                     guard.status = Status::Error(e.to_string());
@@ -293,6 +300,57 @@ async fn connect(
     .map_err(|e| anyhow::anyhow!("Unrecognised audio format: {e}"))
 }
 
+/// Decodes on a thread of its own and hands the player finished chunks.
+///
+/// The decoder used to go to the player as it was, so the audio callback read
+/// the network itself. A live server sends in real time, so once a hiccup had
+/// eaten the prefetch there was no lead left, and every read after that waited
+/// on the network inside the callback: a crackle that lasted until the station
+/// was restarted. Now the callback only ever finds audio or an empty queue, and
+/// an empty queue pauses the sound until a lead of [`REBUFFER_CHUNKS`] is back.
+fn feed(
+    mut source: impl rodio::Source,
+    player: &rodio::Player,
+    current: &AtomicU64,
+    generation: u64,
+) {
+    let stale = || current.load(Ordering::SeqCst) != generation;
+    loop {
+        // A station can change its format between tracks, and a chunk carries one.
+        let (channels, rate) = (source.channels(), source.sample_rate());
+        let len = rate.get() as usize * usize::from(channels.get()) / CHUNKS_PER_SECOND;
+        let mut chunk = Vec::with_capacity(len);
+        let mut ended = false;
+        while chunk.len() < len && source.channels() == channels && source.sample_rate() == rate {
+            match source.next() {
+                Some(sample) => chunk.push(sample),
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if stale() || chunk.is_empty() {
+            return;
+        }
+        if player.empty() {
+            player.pause();
+        }
+        player.append(rodio::buffer::SamplesBuffer::new(channels, rate, chunk));
+        if player.is_paused() && player.len() >= REBUFFER_CHUNKS && !stale() {
+            player.play();
+        }
+        // The station ended or broke: the queue plays out and runs dry, which is
+        // what the reconnect watches for.
+        if ended {
+            return;
+        }
+        while player.len() > MAX_CHUNKS && !stale() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
 /// Passes a new `StreamTitle` into the shared state.
 fn apply_metadata(state: &Mutex<SharedState>, metadata: &IcyMetadata) {
     let mut guard = state.lock().expect("state mutex poisoned");
@@ -400,6 +458,44 @@ mod tests {
         assert!(now.bitrate.is_some(), "the bitrate is missing");
         assert!(now.has_track_info(), "no track metadata arrived");
         println!("{now:#?}");
+    }
+
+    #[test]
+    fn holds_the_sound_until_a_lead_is_decoded() {
+        let (player, _output) = rodio::Player::new();
+        let rate = std::num::NonZero::new(48_000).unwrap();
+        let channels = std::num::NonZero::new(2).unwrap();
+        let gen_ = AtomicU64::new(0);
+
+        // One second is less than the lead: the sound stays paused.
+        let second = vec![0.0; 48_000 * 2];
+        feed(
+            rodio::buffer::SamplesBuffer::new(channels, rate, second.clone()),
+            &player,
+            &gen_,
+            0,
+        );
+        assert_eq!(player.len(), CHUNKS_PER_SECOND);
+        assert!(player.is_paused());
+
+        // Two more seconds pass the lead, and it plays.
+        feed(
+            rodio::buffer::SamplesBuffer::new(channels, rate, [second.clone(), second].concat()),
+            &player,
+            &gen_,
+            0,
+        );
+        assert_eq!(player.len(), 3 * CHUNKS_PER_SECOND);
+        assert!(!player.is_paused());
+
+        // A stale feed appends nothing.
+        feed(
+            rodio::buffer::SamplesBuffer::new(channels, rate, vec![0.0; 10]),
+            &player,
+            &gen_,
+            1,
+        );
+        assert_eq!(player.len(), 3 * CHUNKS_PER_SECOND);
     }
 
     #[test]
