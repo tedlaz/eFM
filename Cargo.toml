@@ -1,6 +1,6 @@
 [package]
 name = "efm"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 # The package stays lowercase (that is what crates.io wants), but the executable
