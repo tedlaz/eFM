@@ -12,20 +12,30 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 directories = "6.0.0"
-# Without the default features: wgpu drags in a whole shader compiler (naga) that
-# we do not need — glow is plenty for the two triangles we paint.
-eframe = { version = "0.36.1", default-features = false, features = [
-    "glow",
-    "wayland",
-    "x11",
-] }
 # Windows loads Segoe UI at runtime instead (see the target section below), so
 # the bundled fonts are off by default and switched back on for other targets.
 egui = { version = "0.36.1", default-features = false }
+# No eframe: it only paints through a GPU, and the OpenGL driver alone mapped
+# some 130MB into this process (DX12 through wgpu was measured worse still).
+# The window is winit's, egui-winit feeds it to egui, and the pixels are painted
+# on the CPU and handed to the window with softbuffer — see `main::Runner`.
+egui-winit = { version = "0.36.1", default-features = false, features = [
+    "clipboard",
+    "wayland",
+    "x11",
+] }
+egui_software_backend = { path = "vendor/egui_software_backend" }
+# Not new: egui-winit builds it. It turns softbuffer's u32 pixels into the
+# bytes the renderer writes.
+bytemuck = "1.25"
+softbuffer = "0.4"
+winit = { version = "0.30.13", default-features = false, features = [
+    "rwh_06",
+    "wayland",
+    "wayland-dlopen",
+    "x11",
+] }
 icy-metadata = { version = "0.6.0", features = ["reqwest"] }
-# Not a new dependency: eframe already builds it. Naming the version it picked
-# is what lets us read the window handle it hands us, for the DWM calls.
-raw-window-handle = "0.6.2"
 # The file dialog for exporting/importing the list. On Windows it is the native
 # dialog; on Linux the default features give us the xdg-portal one.
 rfd = "0.17.2"

@@ -1,0 +1,27 @@
+# ponytail: vendored egui_software_backend 0.0.3 (MIT OR Apache-2.0,
+# https://github.com/DGriffin91/egui_software_backend), cut down to the renderer.
+# The release on crates.io wants egui 0.34; the only changes are the ones 0.36
+# asked for — `ahash::HashMap` became std's, and `TexturesDelta::set` holds a list
+# of deltas per texture. Delete this directory and depend on crates.io as soon as
+# upstream publishes a release for egui 0.36.
+[package]
+name = "egui_software_backend"
+version = "0.0.3"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+egui = { version = "0.36.1", default-features = false }
+strength_reduce = "0.2.4"
+constify = "0.0.1"
+rayon = { version = "1.11.0", optional = true }
+log = { version = "0.4", optional = true }
+
+[features]
+default = ["std"]
+# Not optional any more: the HashMap is std's now.
+std = []
+raster_stats = ["std"]
+log = ["dep:log"]
+rayon = ["dep:rayon"]

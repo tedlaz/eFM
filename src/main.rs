@@ -11,6 +11,16 @@ use config::Config;
 use player::Player;
 use search::Search;
 
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::time::Instant;
+
+use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle};
+use winit::window::{Window, WindowId};
+
 /// The window height with the drawer open. It is only the starting point: as
 /// soon as the user resizes the window, that is the height the drawer gives back.
 const UNFOLDED_HEIGHT: f32 = 720.0;
@@ -20,12 +30,13 @@ const UNFOLDED_HEIGHT: f32 = 720.0;
 /// measures it and corrects this guess.
 pub const FOLDED_HEIGHT: f32 = 196.0;
 
-fn main() -> eframe::Result {
+fn main() -> anyhow::Result<()> {
     // The settings are read before the window exists, because the place it should
     // open at is one of them.
     let config = Config::load();
 
     let mut viewport = egui::ViewportBuilder::default()
+        .with_title("eFM")
         // Folded is how the app starts, so that is the size it is born at: opening
         // tall and snapping shut on the first frame would be a flinch.
         .with_inner_size([480.0, FOLDED_HEIGHT])
@@ -43,20 +54,231 @@ fn main() -> eframe::Result {
         viewport = viewport.with_position([x, y]);
     }
 
-    let options = eframe::NativeOptions {
-        viewport,
-        // ponytail: no software-rendering knob here — HardwareAcceleration::Off was
-        // tried and WGL has no non-accelerated pixel format that egui can use, so
-        // glutin finds no config and the app does not start. The ~130MB the AMD
-        // driver maps into this process is the price of having a window at all.
-        ..Default::default()
-    };
+    let event_loop = EventLoop::<Instant>::with_user_event().build()?;
+    let ctx = egui::Context::default();
+    // Whatever asks egui for a frame — the audio thread, the search worker, an
+    // animation, a reconnect timer — reaches the event loop as the moment that
+    // frame is due. Nothing else wakes it: an idle radio draws nothing at all.
+    let proxy = event_loop.create_proxy();
+    ctx.set_request_repaint_callback(move |info| {
+        if let Some(at) = Instant::now().checked_add(info.delay) {
+            let _ = proxy.send_event(at);
+        }
+    });
 
-    eframe::run_native(
-        "eFM",
-        options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, config)))),
-    )
+    let mut runner = Runner {
+        softbuffer: softbuffer::Context::new(event_loop.owned_display_handle()).map_err(soft)?,
+        ctx,
+        viewport,
+        config: Some(config),
+        shown: None,
+        due: None,
+        failed: None,
+    };
+    event_loop.run_app(&mut runner)?;
+    runner.failed.map_or(Ok(()), Err)
+}
+
+/// softbuffer's errors can carry a raw window handle, which may not cross
+/// threads, so anyhow takes them as the message.
+fn soft(e: softbuffer::SoftBufferError) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
+/// What eframe used to be, cut down to the one window this app has.
+///
+/// eframe only knows how to paint through a GPU, and a GPU driver is a heavy
+/// thing to load for a radio: the AMD OpenGL one mapped some 130MB into the
+/// process, and wgpu on DX12 was measured worse still. So egui paints on the CPU
+/// (`egui_software_backend`) and softbuffer hands the pixels to the window.
+struct Runner {
+    ctx: egui::Context,
+    viewport: egui::ViewportBuilder,
+    /// Handed to the app when the window is made.
+    config: Option<Config>,
+    softbuffer: softbuffer::Context<OwnedDisplayHandle>,
+    shown: Option<Shown>,
+    /// When the next frame is owed, if one is.
+    due: Option<Instant>,
+    /// Why the event loop was stopped, when it was not the user closing it.
+    failed: Option<anyhow::Error>,
+}
+
+/// Everything that exists only while the window does.
+struct Shown {
+    window: Rc<Window>,
+    surface: softbuffer::Surface<OwnedDisplayHandle, Rc<Window>>,
+    state: egui_winit::State,
+    info: egui::ViewportInfo,
+    renderer: EguiSoftwareRender,
+    /// Texture changes egui has handed out and the renderer has not seen yet.
+    /// A minimised window paints nothing, but the font atlas still grows while
+    /// it is down there, and losing that would leave the text broken on return.
+    textures: egui::TexturesDelta,
+    app: App,
+}
+
+impl Runner {
+    fn show(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        let Some(config) = self.config.take() else {
+            return Ok(());
+        };
+        let window = Rc::new(egui_winit::create_window(
+            &self.ctx,
+            event_loop,
+            &self.viewport,
+        )?);
+        let surface = softbuffer::Surface::new(&self.softbuffer, window.clone()).map_err(soft)?;
+        let state = egui_winit::State::new(
+            self.ctx.clone(),
+            egui::ViewportId::ROOT,
+            event_loop,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        );
+        let mut info = egui::ViewportInfo::default();
+        egui_winit::update_viewport_info(&mut info, &self.ctx, &window, true);
+        let app = App::new(&self.ctx, &window, config);
+        self.shown = Some(Shown {
+            window,
+            surface,
+            state,
+            // softbuffer wants 0RGB in a u32, which in memory is B, G, R, 0.
+            renderer: EguiSoftwareRender::new(ColorFieldOrder::Bgra),
+            info,
+            textures: egui::TexturesDelta::default(),
+            app,
+        });
+        self.due = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Runs the app for one frame and puts the result on the screen. Returns
+    /// `false` once the app has asked to be closed.
+    fn frame(&mut self) -> anyhow::Result<bool> {
+        let Some(shown) = &mut self.shown else {
+            return Ok(true);
+        };
+        egui_winit::update_viewport_info(&mut shown.info, &self.ctx, &shown.window, false);
+        let mut input = shown.state.take_egui_input(&shown.window);
+        input
+            .viewports
+            .insert(egui::ViewportId::ROOT, shown.info.clone());
+
+        let mut output = self.ctx.run_ui(input, |ui| shown.app.ui(ui, &shown.window));
+
+        // Drag, resize, minimise, close: what the title bar asked the window for.
+        if let Some(viewport) = output.viewport_output.remove(&egui::ViewportId::ROOT) {
+            egui_winit::process_viewport_commands(
+                &self.ctx,
+                &mut shown.info,
+                viewport.commands,
+                &shown.window,
+                &mut Vec::new(),
+            );
+            if let Some(at) = Instant::now().checked_add(viewport.repaint_delay) {
+                self.due = Some(self.due.map_or(at, |due| due.min(at)));
+            }
+        }
+        shown
+            .textures
+            .append(std::mem::take(&mut output.textures_delta));
+        shown
+            .state
+            .handle_platform_output(&shown.window, output.platform_output);
+        if shown.info.events.contains(&egui::ViewportEvent::Close) {
+            return Ok(false);
+        }
+
+        // Minimised, the window has no pixels to fill. The app still ran above:
+        // the reconnect and the sleep lock must not wait for the window to be
+        // looked at again.
+        let size = shown.window.inner_size();
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return Ok(true);
+        };
+        let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+        shown.surface.resize(width, height).map_err(soft)?;
+        let mut buffer = shown.surface.buffer_mut().map_err(soft)?;
+        // Whatever the frame does not cover is the backdrop, not black: a black
+        // flash behind a half-drawn frame is what this used to look like.
+        let [r, g, b, _] = theme::p().backdrop.to_array();
+        buffer.fill(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b));
+        let mut pixels = BufferMutRef::new(
+            bytemuck::cast_slice_mut(&mut buffer),
+            width.get() as usize,
+            height.get() as usize,
+        );
+        shown.renderer.render(
+            &mut pixels,
+            &primitives,
+            &shown.textures,
+            output.pixels_per_point,
+        );
+        shown.textures.clear();
+        buffer.present().map_err(soft)?;
+        Ok(true)
+    }
+
+    /// Runs a frame and stops the loop if it asks for that, or fails.
+    fn frame_or_exit(&mut self, event_loop: &ActiveEventLoop) {
+        match self.frame() {
+            Ok(true) => {}
+            Ok(false) => self.exit(event_loop),
+            Err(e) => {
+                self.failed = Some(e);
+                self.exit(event_loop);
+            }
+        }
+    }
+
+    fn exit(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(mut shown) = self.shown.take() {
+            shown.app.on_exit();
+        }
+        event_loop.exit();
+    }
+}
+
+impl ApplicationHandler<Instant> for Runner {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(e) = self.show(event_loop) {
+            self.failed = Some(e);
+            event_loop.exit();
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let Some(shown) = &mut self.shown else { return };
+        match event {
+            WindowEvent::CloseRequested => self.exit(event_loop),
+            // The system wants the window painted — shown again, uncovered,
+            // resized — and it wants it now, not at the next wake-up.
+            WindowEvent::RedrawRequested => self.frame_or_exit(event_loop),
+            event => {
+                if shown.state.on_window_event(&shown.window, &event).repaint {
+                    self.due = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    fn user_event(&mut self, _: &ActiveEventLoop, at: Instant) {
+        self.due = Some(self.due.map_or(at, |due| due.min(at)));
+    }
+
+    // All the events that were waiting have been handled: one frame answers all
+    // of them, however many mouse moves there were.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.due.is_some_and(|due| due <= Instant::now()) {
+            self.due = None;
+            self.frame_or_exit(event_loop);
+        }
+        event_loop.set_control_flow(self.due.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
 }
 
 /// Asks the system to stay awake while a station plays, and lets go when it
@@ -96,11 +318,10 @@ fn keep_system_awake(awake: bool) {
 /// edge.
 ///
 /// ponytail: no `windows` crate for two constants and one call, for the same
-/// reason `keep_system_awake` declares its own. `raw-window-handle` is not a new
-/// dependency either — eframe already builds it; we only name the version it
-/// picked, so that we can read the handle it hands us.
+/// reason `keep_system_awake` declares its own. The handle comes from winit,
+/// which re-exports the `raw-window-handle` it was built with.
 #[cfg(windows)]
-fn dress_for_windows_11(window: &impl raw_window_handle::HasWindowHandle) {
+fn dress_for_windows_11(window: &impl winit::raw_window_handle::HasWindowHandle) {
     #[link(name = "dwmapi")]
     unsafe extern "system" {
         fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const u32, size: u32) -> i32;
@@ -113,7 +334,7 @@ fn dress_for_windows_11(window: &impl raw_window_handle::HasWindowHandle) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
-    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_ref() else {
+    let winit::raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_ref() else {
         return;
     };
     let hwnd = win32.hwnd.get();
@@ -131,7 +352,7 @@ fn dress_for_windows_11(window: &impl raw_window_handle::HasWindowHandle) {
 }
 
 #[cfg(not(windows))]
-fn dress_for_windows_11(_window: &impl raw_window_handle::HasWindowHandle) {}
+fn dress_for_windows_11(_window: &impl winit::raw_window_handle::HasWindowHandle) {}
 
 /// A colour the way Windows spells one: COLORREF is 0x00BBGGRR, which is the
 /// reverse of the order the theme — and everything else — writes it in. Getting
@@ -236,20 +457,22 @@ struct App {
     /// window is born at a guessed height, and this is what stops us from asking
     /// about it over and over if it will not take it.
     folded_trimmed: bool,
+    /// When the last frame went out, for the pacing in `ui`.
+    last_frame: std::time::Instant,
     /// Set when the palette changes: the border DWM paints around the window is
     /// ours too, and it is only repainted when we ask.
     repaint_border: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
+    fn new(ctx: &egui::Context, window: &Window, config: Config) -> Self {
         // The palette is chosen before the style is written, so the first frame is
         // already in the right colours.
         theme::set(&config.theme);
-        theme::apply(&cc.egui_ctx);
-        dress_for_windows_11(cc);
+        theme::apply(ctx);
+        dress_for_windows_11(window);
 
-        let (player, audio_error) = match Player::new(cc.egui_ctx.clone()) {
+        let (player, audio_error) = match Player::new(ctx.clone()) {
             Ok(player) => {
                 player.set_volume(config.volume);
                 (Some(player), None)
@@ -277,6 +500,7 @@ impl App {
             cover_until: None,
             folded_trimmed: false,
             repaint_border: false,
+            last_frame: std::time::Instant::now(),
         };
 
         if app.config.autoplay && !app.config.last_url.is_empty() {
@@ -500,22 +724,31 @@ fn recovery(
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+impl App {
+    fn ui(&mut self, ui: &mut egui::Ui, window: &Window) {
+        // A frame every 16ms at the most. Every mouse move is a repaint, and a
+        // mouse that reports at 1000Hz once drove the window at some 500 frames a
+        // second — which was flashing under OpenGL, and would be the CPU painting
+        // every pixel 500 times a second now. The window is a radio; 60 frames a
+        // second is more than it has to say.
+        const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+        let since = self.last_frame.elapsed();
+        if since < FRAME {
+            std::thread::sleep(FRAME - since);
+        }
+        self.last_frame = std::time::Instant::now();
+
         self.watch_window_pos(ui.ctx());
         self.watch_for_dropped_stream(ui.ctx());
         self.watch_sleep();
         ui::draw(self, ui);
-        // A palette was picked this frame. `Frame` is a window handle, which is
-        // all the DWM call wants, so the border simply gets painted again.
+        // A palette was picked this frame, and the border DWM paints is ours too.
         if std::mem::take(&mut self.repaint_border) {
-            dress_for_windows_11(frame);
+            dress_for_windows_11(window);
         }
     }
 
-    // The glow backend hands over the OpenGL context here, for anyone who has GPU
-    // resources to release. We just save the settings.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.config.save();
         // A power request left standing after the app is gone would keep the
         // machine up for nothing at all.
